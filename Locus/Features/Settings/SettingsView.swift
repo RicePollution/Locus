@@ -92,6 +92,10 @@ struct SettingsView: View {
                     }
                     if let port = session.activePort {
                         LabeledContent("Tunnel port", value: String(port))
+                    } else if let port = session.lastTunnelPort {
+                        LabeledContent("Tunnel port", value: "\(port) (last used)")
+                    } else {
+                        LabeledContent("Tunnel port", value: "—")
                     }
                     Button("Save tunnel IP") {
                         TunnelConfig.setTargetIP(tunnelIP)

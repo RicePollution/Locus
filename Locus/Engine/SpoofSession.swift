@@ -88,6 +88,10 @@ final class SpoofSession: ObservableObject {
     /// `confirmedTunnelIP` this is never retracted: it describes the setup, not the link.
     @Published private(set) var provenTunnelIPs: Set<String> = []
     @Published private(set) var activePort: UInt16?
+    /// The last port that actually carried a tunnel, kept after the session ends. The live
+    /// `activePort` is cleared on stop, which hid the number at exactly the moment a user
+    /// diagnosing a dead tunnel needs it. Never retracted; it is a diagnostic, not a claim.
+    @Published private(set) var lastTunnelPort: UInt16?
 
     @Published var favorites: [SavedPlace] = []
     @Published var recents: [SavedPlace] = []
@@ -358,6 +362,7 @@ final class SpoofSession: ObservableObject {
             simulated = coordinate
             pin = coordinate
             activePort = applied.port
+            lastTunnelPort = applied.port
             confirmedTunnelIP = TunnelConfig.targetIP
             provenTunnelIPs.insert(TunnelConfig.targetIP)
             consecutiveFailures = 0
