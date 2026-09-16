@@ -56,8 +56,8 @@ xcodebuild -project Locus.xcodeproj -scheme Locus -configuration Release \
 ```
 
 - `xcodebuild` needs full Xcode selected: `sudo xcode-select -s /Applications/Xcode.app`. On this
-  machine `xcode-select -p` currently points at `/Library/Developer/CommandLineTools`, where
-  `xcodebuild` refuses to run.
+  machine that is already the case (Xcode 26.5); if `xcode-select -p` ever reports
+  `/Library/Developer/CommandLineTools`, `xcodebuild` refuses to run and this is why.
 - **Simulator builds do not link.** `Vendor/idevice/libidevice_ffi.a` is a single arm64 slice built
   for `PLATFORM_IOS` (device), and `OTHER_LDFLAGS` links `-lidevice_ffi` unconditionally. Use a real
   device or `generic/platform=iOS`.
@@ -145,6 +145,47 @@ screens), `Support/` (shared models and styling).
   answered earlier this process, `.unknown` only for an IP that has never answered). `.unknown` is
   the sole state that prompts "Connect LocalDevVPN". Reachability must never gate a teleport.
 
+### Routes, and the speed a route is followed at
+
+`RouteBuilder` asks MapKit for **alternate** routes and ranks them by `expectedTravelTime`
+(tie-broken on distance, since Swift's sort is not stable and a reshuffle would silently swap which
+route is highlighted), with a `departureDate` so automobile ETAs are traffic-aware at all. The
+planner lists them; `MapHomeView` draws the unpicked ones greyed.
+
+Sampling densifies a route to ~12 m, and the two guards around that exist because the old fixed step
+**stopped dead at a 20,000-point ceiling and dropped the tail** — a 1000 km route kept 17% of its
+span and the follower walked to somewhere in the middle and halted. `thinned` now decimates an
+oversized input and `spacing(forRouteLength:)` widens the step, so the budget is spent evenly across
+the whole route. `maxSourcePoints` and `maxSampledPoints` are bound together by the arithmetic in
+`spacing`: worst case is ~19,250 against the 20,000 ceiling, and if you change either constant,
+re-derive that or the truncation bug comes back with no signal.
+
+**Posted speed limits** (`Engine/SpeedLimits.swift`, `SpeedLimitService.swift`,
+`SpeedLimitMatcher.swift`, `RoutePacer.swift`). MapKit exposes no speed-limit data on any framework,
+so `.drive` routes get theirs from OpenStreetMap's `maxspeed` tag via Overpass. Measured coverage of
+that tag on drivable ways is only 29–52%, so the `highway=` class-defaults table carries most of a
+route — `SpeedSource` records which link of the chain produced each zone (posted → class default →
+Apple's own average for the route → `TravelMode.baseSpeed`, which is the pre-feature behaviour), and
+an inferred speed renders with a tilde so a guess never reads as a fact.
+
+Four things here are load-bearing and easy to break:
+
+- **The lookup never blocks route building.** It hangs off `load(route:)`, not `buildRoadRoute()`.
+  Overpass is volunteer-run and returns 504 under load; a route must draw and follow regardless.
+- **No network-derived value may reach `LocationEngine`.** OSM geometry is used only for distance
+  and bearing; every coordinate applied to the device comes from MapKit or a local GPX. A speed
+  profile can only modulate *timing* along a locally-sourced polyline, never position.
+- **The query is a corridor around the chord between points**, not around the road, which is why the
+  polyline is decimated with Douglas–Peucker and why `queryRadius >= matchRadius + tolerance` must
+  hold — the radius is derived from the tolerance actually achieved, so a widened tolerance cannot
+  silently uncover the route.
+- **Matching needs the bearing gate.** A route polyline passes within 20 m of every road it crosses,
+  so without an undirected bearing test every point near a crossroads matches the cross street.
+
+`RoutePacer` steps by *distance* rather than time, so the apply cadence does not scale with the
+posted limit, and ramps between zones instead of delivering a 40 mph step change inside one 12 m
+hop. With no profile it bypasses the ramp entirely and reproduces the old follower.
+
 ### The two pairing paths
 
 `PairingStore` owns one file: `Application Support/Pairing/rp_pairing_file.plist`, chmod `0600`.
@@ -204,5 +245,12 @@ and instrument the handler to see whether it runs at all, rather than reasoning 
 - Errors surface to the user as `session.lastError` (an alert bound in `RootView` and
   `SetupFlowView`) and, for dropped sessions, a local notification. Prefer that over silent failure
   in Engine code; FFI errors must always be freed with `idevice_error_free`.
+- **The Settings privacy text is a contract, not copy.** Locus makes exactly one outbound request —
+  the Overpass lookup — and the Privacy and Driving strings in `SettingsView` describe it precisely:
+  what is sent, that stretches within 500 m of the device's own position are withheld, and that the
+  server still sees an IP and a User-Agent naming the app. That exclusion is tested against the
+  *corridor* the query describes, not its vertices, because Douglas–Peucker collapses a straight road
+  to its endpoints and a vertex test passes while 6 km of corridor runs past the user's door. If you
+  change what is transmitted, change those strings in the same commit.
 - The README's Pokémon GO section is a deliberate scope boundary: Locus is a system-level location
   override and explicitly does not patch or bypass any app's own location checks.
