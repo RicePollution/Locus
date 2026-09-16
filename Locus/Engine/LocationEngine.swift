@@ -10,6 +10,7 @@ enum LocationEngineError: LocalizedError {
     case locationSet
     case locationClear
     case notActive
+    case portUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -21,6 +22,8 @@ enum LocationEngineError: LocalizedError {
         case .locationSet: return "Failed to set simulated coordinates."
         case .locationClear: return "Failed to clear simulated location."
         case .notActive: return "No active simulation session."
+        case .portUnavailable:
+            return "No developer tunnel answered on \(TunnelConfig.targetIP). Tried port \(RemotePairingDiscovery.fallbackPort) and found no _remotepairing service. Is LocalDevVPN connected on Wi‑Fi?"
         }
     }
 
@@ -29,6 +32,7 @@ enum LocationEngineError: LocalizedError {
         case 1: return .invalidIP
         case 2: return .pairingRead
         case 3: return .tunnelCreate
+        case 4: return .portUnavailable
         case 9: return .remoteServer
         case 10: return .simulationCreate
         case 11: return .locationSet
@@ -36,6 +40,12 @@ enum LocationEngineError: LocalizedError {
         default: return .locationSet
         }
     }
+}
+
+/// Outcome of a successful `set`, for diagnostics in Settings.
+struct LocationApplied: Sendable, Equatable {
+    let port: UInt16
+    let rebuiltTunnel: Bool
 }
 
 /// Thin Swift wrapper around idevice’s DVT location simulation (injects into locationd).
@@ -56,24 +66,94 @@ enum LocationEngine {
     private static let locationSet: Int32 = 11
     private static let locationClear: Int32 = 12
 
-    static var isSessionActive: Bool { locationSimulation != nil }
+    /// Port the live session was built on, so the fast path can still report one.
+    private static var sessionPort: UInt16?
 
-    static func set(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Result<Void, LocationEngineError> {
-        var result: Result<Void, LocationEngineError> = .failure(.locationSet)
-        queue.sync {
-            let code = setLocked(latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP)
-            result = code == ok ? .success(()) : .failure(.from(code: code))
+    static func set(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) async -> Result<LocationApplied, LocationEngineError> {
+        let tried = RemotePairingDiscovery.candidates(for: deviceIP)
+        let first = await onQueue {
+            attemptLocked(ports: tried, latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP)
         }
-        return result
+        if first.code == ok {
+            // `ok` always carries a port; the coalesce only exists to keep the type honest,
+            // and the historical hardcoded port is the right thing to name if it ever fires.
+            return .success(LocationApplied(port: first.reachedPort ?? RemotePairingDiscovery.fallbackPort, rebuiltTunnel: first.rebuiltTunnel))
+        }
+        guard first.code == tunnelCreate else { return .failure(.from(code: first.code)) }
+
+        // Every candidate refused at the tunnel layer, so the port is what we got wrong.
+        // Browsing is off the queue: Bonjour must not block the FFI serializer.
+        guard let discovered = await RemotePairingDiscovery.discover(targetIP: deviceIP),
+              !tried.contains(discovered) else { return .failure(.portUnavailable) }
+
+        let second = await onQueue {
+            attemptLocked(ports: [discovered], latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP)
+        }
+        guard second.code == ok else {
+            // Every candidate and the discovered port refused at the tunnel layer. Say
+            // that, rather than repeating the generic "could not open the tunnel".
+            return .failure(second.code == tunnelCreate ? .portUnavailable : .from(code: second.code))
+        }
+        return .success(LocationApplied(port: second.reachedPort ?? discovered, rebuiltTunnel: second.rebuiltTunnel))
     }
 
-    static func clear() -> Result<Void, LocationEngineError> {
-        var result: Result<Void, LocationEngineError> = .failure(.notActive)
-        queue.sync {
-            let code = clearLocked()
-            result = code == ok ? .success(()) : .failure(.from(code: code))
+    static func clear() async -> Result<Void, LocationEngineError> {
+        let code = await onQueue { clearLocked() }
+        return code == ok ? .success(()) : .failure(.from(code: code))
+    }
+
+    /// Hops onto the FFI serializer without ever blocking the caller's thread.
+    private static func onQueue<T>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+            queue.async { continuation.resume(returning: work()) }
         }
-        return result
+    }
+
+    /// Tries each candidate port in turn inside a single queue hop. A returned `ok`
+    /// always carries the port the live session sits on.
+    private static func attemptLocked(
+        ports: [UInt16],
+        latitude: Double,
+        longitude: Double,
+        pairingPath: String,
+        deviceIP: String
+    ) -> (code: Int32, reachedPort: UInt16?, rebuiltTunnel: Bool) {
+        if let locationSimulation {
+            if let err = location_simulation_set(locationSimulation, latitude, longitude) {
+                idevice_error_free(err)
+                cleanup()
+            } else {
+                return (ok, sessionPort, false)
+            }
+        }
+
+        for port in ports {
+            let code = setLocked(
+                latitude: latitude,
+                longitude: longitude,
+                pairingPath: pairingPath,
+                deviceIP: deviceIP,
+                port: port
+            )
+            switch code {
+            case ok:
+                sessionPort = port
+                RemotePairingDiscovery.recordSuccess(port: port, for: deviceIP)
+                return (ok, port, true)
+            case tunnelCreate:
+                RemotePairingDiscovery.invalidate(port: port, for: deviceIP)
+                continue
+            case remoteServerCode, simulationCreate, locationSet:
+                // The tunnel itself answered here, so the port was right and only the
+                // layers above it failed — keep it rather than hunting for another.
+                RemotePairingDiscovery.recordSuccess(port: port, for: deviceIP)
+                return (code, port, true)
+            default:
+                return (code, nil, false)
+            }
+        }
+        // Every candidate refused the tunnel; `set` takes this as its cue to browse.
+        return (tunnelCreate, nil, false)
     }
 
     private static func cleanup() {
@@ -95,19 +175,10 @@ enum LocationEngine {
         }
     }
 
-    private static func setLocked(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Int32 {
-        if let locationSimulation {
-            if let err = location_simulation_set(locationSimulation, latitude, longitude) {
-                idevice_error_free(err)
-                cleanup()
-            } else {
-                return ok
-            }
-        }
-
+    private static func setLocked(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String, port: UInt16) -> Int32 {
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = in_port_t(49152).bigEndian
+        address.sin_port = in_port_t(port).bigEndian
         let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
         guard inetResult == 1 else { return invalidIP }
 
@@ -162,7 +233,14 @@ enum LocationEngine {
     }
 
     private static func clearLocked() -> Int32 {
-        guard let locationSimulation else { return locationClear }
+        guard let locationSimulation else {
+            // Nothing to clear is a successful stop, not a failure. Every failing apply
+            // already ran cleanup(), so this is the ordinary state after a dropped
+            // session — reporting it as an error made Stop raise an alert every time.
+            // Running cleanup() here keeps "clear leaves all handles nil" structural.
+            cleanup()
+            return ok
+        }
         let err = location_simulation_clear(locationSimulation)
         cleanup()
         if let err {

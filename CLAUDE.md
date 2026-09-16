@@ -77,28 +77,42 @@ screens), `Support/` (shared models and styling).
 
 - **`LocationEngine`** (`Engine/LocationEngine.swift`) is the only code that touches the FFI for
   spoofing. It is an `enum` namespace holding four static `OpaquePointer` handles (adapter,
-  handshake, remote server, location simulation), serialized by a private `DispatchQueue` with
-  `.sync`. `set(...)` first tries `location_simulation_set` on the live handle; on any failure it
-  tears everything down and rebuilds the whole tunnel from the pairing file. Two details that bite:
-  the tunnel port `49152` is hardcoded, and `location_simulation_new` takes ownership of the remote
-  server, so `remoteServer` is deliberately set to `nil` afterwards to avoid a double free.
+  handshake, remote server, location simulation), serialized by a private `DispatchQueue`. `set(...)`
+  and `clear(...)` are `async` facades over that queue (`withCheckedContinuation` + `queue.async`) —
+  never `.sync`, because they are called from the main actor. `set(...)` first tries
+  `location_simulation_set` on the live handle; on any failure it tears everything down and rebuilds
+  the whole tunnel from the pairing file. Two details that bite: the tunnel port is a *guess* —
+  `RemotePairingDiscovery` supplies candidates (last-known-good, then `49152`, then a Bonjour
+  `_remotepairing._tcp` result) and the rebuild only advances to the next candidate on a
+  `tunnel_create_rppairing` failure, since codes 9/10/11 prove the port was right; and
+  `location_simulation_new` takes ownership of the remote server, so `remoteServer` is deliberately
+  set to `nil` afterwards to avoid a double free.
   FFI integer codes are mapped to messages in `LocationEngineError.from(code:)` — those constants
-  mirror the Rust side and must stay in sync with the private `Int32` constants above them.
+  mirror the Rust side and must stay in sync with the private `Int32` constants above them. Code `4`
+  (`portUnavailable`) is ours, not Rust's.
 - **`SpoofSession`** (`Engine/SpoofSession.swift`) is the `@MainActor` `ObservableObject` that every
   view observes — the single source of truth for status, pin, simulated coordinate, favorites, and
-  recents. It owns three repeating timers, all of which exist for a reason:
-  - **resend every 8s** — iOS drops the simulated fix if nothing re-asserts it;
-  - **health check every 12s** — re-applies the last coordinate when `LocationEngine.isSessionActive`
-    goes false or status is `.dropped`, which is what makes a session survive Wi‑Fi → cellular;
+  recents. It owns two repeating timers, both of which exist for a reason:
+  - **resend every 8s** — iOS drops the simulated fix if nothing re-asserts it. It keeps firing while
+    the status is `.dropped` (only `stop()` cancels it), so it is also the reconnect path that makes
+    a session survive Wi‑Fi → cellular;
   - **joystick tick at 0.25s** — converts the pad vector into a metric offset at `TravelMode.baseSpeed`
     with ±10% jitter.
 
   Route following is a cancellable `Task` that interpolates between sampled coordinates and sleeps
-  by distance/speed. Every coordinate change funnels through the private `apply(_:pairing:markRecent:)`,
-  which is also where background-task and notification side effects live.
+  by distance/speed. Every coordinate change funnels through the private `request(...)` → `enqueue` →
+  `drain`, a latest-wins coalescer with a single one-slot `pending` intent: the public API stays
+  synchronous and `Void` while the engine call is `async`, and a `.clear` always outranks a queued
+  `.apply`. `desired` is the intent (what the resend and joystick read); `simulated` is only written
+  on a confirmed success and is what the UI renders. Background-task and notification side effects
+  live in the drain.
 - **`TunnelConfig`** (`Engine/DeviceTunnel.swift`) resolves the tunnel IP (default `10.7.0.1`).
   **`LocalDevVPN`** (`Support/LocalDevVPN.swift`) detects the external LocalDevVPN app by URL scheme
-  and infers "connected" by scanning `getifaddrs` for an address on the tunnel's /24.
+  and infers "connected" by scanning `getifaddrs` for an address on the tunnel's /24. That scan is a
+  false negative for loopback-mode proxies, so `reachability(confirmedTarget:)` grades it three ways
+  (`.confirmed` from a live engine round-trip, `.likely` from the scan *or* from that IP having
+  answered earlier this process, `.unknown` only for an IP that has never answered). `.unknown` is
+  the sole state that prompts "Connect LocalDevVPN". Reachability must never gate a teleport.
 
 ### The two pairing paths
 

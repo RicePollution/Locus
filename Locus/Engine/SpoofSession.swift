@@ -72,6 +72,7 @@ enum SpoofStatus: Equatable {
 final class SpoofSession: ObservableObject {
     @Published var status: SpoofStatus = .idle
     @Published var pin: CLLocationCoordinate2D?
+    /// What the engine has actually confirmed — this is what the UI renders.
     @Published var simulated: CLLocationCoordinate2D?
     @Published var travelMode: TravelMode = .walk
     @Published var mapStyleIndex: Int = 0
@@ -79,11 +80,38 @@ final class SpoofSession: ObservableObject {
     @Published var isBusy = false
     @Published var joystickActive = false
 
+    /// Tunnel IP the engine has actually reached, and the port it reached it on.
+    @Published private(set) var confirmedTunnelIP: String?
+    /// Tunnel IPs that have answered at least once this process. `LocalDevVPN`'s interface
+    /// scan produces false negatives for loopback-mode proxies, so one success is standing
+    /// proof that a later negative scan for that IP means nothing. Unlike
+    /// `confirmedTunnelIP` this is never retracted: it describes the setup, not the link.
+    @Published private(set) var provenTunnelIPs: Set<String> = []
+    @Published private(set) var activePort: UInt16?
+
     @Published var favorites: [SavedPlace] = []
     @Published var recents: [SavedPlace] = []
 
+    private enum IntentSource {
+        case user, resend, motion
+    }
+
+    private enum EngineIntent {
+        case apply(coordinate: CLLocationCoordinate2D, markRecent: Bool, source: IntentSource)
+        case clear
+    }
+
+    /// Where the user wants to be, as opposed to where the engine has got to. The resend
+    /// and the joystick read this, so a slow engine call can't resurrect a stale fix.
+    private var desired: CLLocationCoordinate2D?
+    private var pending: EngineIntent?
+    private var inFlight = false
+    private var consecutiveFailures = 0
+    private var dropNotified = false
+    private var pairingStore: PairingStore?
+    private let dropThreshold = 3
+
     private var resendTimer: Timer?
-    private var healthTimer: Timer?
     private var joystickTimer: Timer?
     private var routeTask: Task<Void, Never>?
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
@@ -110,7 +138,7 @@ final class SpoofSession: ObservableObject {
             return
         }
         pin = coordinate
-        apply(coordinate, pairing: pairing, markRecent: true)
+        request(coordinate, pairing: pairing, markRecent: true, source: .user)
     }
 
     func stop(pairing: PairingStore) {
@@ -118,23 +146,9 @@ final class SpoofSession: ObservableObject {
         routeTask = nil
         stopJoystick()
         stopResend()
-        stopHealth()
-        isBusy = true
-        let result = LocationEngine.clear()
-        isBusy = false
-        switch result {
-        case .success:
-            simulated = nil
-            status = .idle
-            endBackground()
-            // Keep location updates running so the map puck / locate button
-            // can return to the real GPS fix (not the leftover pin).
-            locationKeeper.start()
-        case .failure(let error):
-            lastError = error.localizedDescription
-            status = .dropped(error.localizedDescription)
-            postDropNotification(error.localizedDescription)
-        }
+        // Drop the intent before the clear lands so an in-flight apply can't re-arm it.
+        desired = nil
+        enqueue(.clear, pairing: pairing)
     }
 
     /// Best-known real device coordinate (not the teleport pin).
@@ -158,7 +172,7 @@ final class SpoofSession: ObservableObject {
             return
         }
         if simulated == nil {
-            apply(start, pairing: pairing, markRecent: false)
+            request(start, pairing: pairing, markRecent: false, source: .user)
         }
         joystickActive = true
         joystickTimer?.invalidate()
@@ -189,7 +203,7 @@ final class SpoofSession: ObservableObject {
             guard let self else { return }
             var previous = coordinates[0]
             await MainActor.run {
-                self.apply(previous, pairing: pairing, markRecent: true)
+                self.request(previous, pairing: pairing, markRecent: true, source: .user)
             }
             for next in coordinates.dropFirst() {
                 if Task.isCancelled { break }
@@ -209,7 +223,7 @@ final class SpoofSession: ObservableObject {
                     let delay = stepMeters / speed
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     await MainActor.run {
-                        self.apply(coord, pairing: pairing, markRecent: false)
+                        self.request(coord, pairing: pairing, markRecent: false, source: .motion)
                     }
                 }
                 previous = next
@@ -287,44 +301,146 @@ final class SpoofSession: ObservableObject {
         return false
     }
 
-    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
-        if status == .idle || status.isDropped {
+    /// The one place `desired` is written: every coordinate the app wants funnels here.
+    private func request(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool, source: IntentSource) {
+        desired = coordinate
+        enqueue(.apply(coordinate: coordinate, markRecent: markRecent, source: source), pairing: pairing)
+    }
+
+    /// Latest-wins: the engine is slow and the joystick ticks four times a second, so
+    /// only the newest intent is ever worth running.
+    private func enqueue(_ intent: EngineIntent, pairing: PairingStore) {
+        pairingStore = pairing
+        if case .apply = intent, case .clear = pending {
+            // A queued stop outranks any coordinate that arrives behind it.
+            return
+        }
+        pending = intent
+        guard !inFlight else { return }
+        inFlight = true
+        Task { await drain() }
+    }
+
+    private func drain() async {
+        defer { inFlight = false }
+        while let intent = pending {
+            pending = nil
+            switch intent {
+            case .apply(let coordinate, let markRecent, let source):
+                await runApply(coordinate, markRecent: markRecent, source: source)
+            case .clear:
+                await runClear()
+            }
+        }
+    }
+
+    private func runApply(_ coordinate: CLLocationCoordinate2D, markRecent: Bool, source: IntentSource) async {
+        // enqueue() records the store before any drain can start, so this never fires.
+        guard let pairing = pairingStore else { return }
+        if status.isDropped {
+            status = .reconnecting
+        } else if status == .idle {
             status = .connecting
         }
         isBusy = true
-        let result = LocationEngine.set(
+        let result = await LocationEngine.set(
             latitude: coordinate.latitude,
             longitude: coordinate.longitude,
             pairingPath: pairing.pairingPath,
             deviceIP: TunnelConfig.targetIP
         )
         isBusy = false
+        // A stop arrived while this was in flight — let it own the status so Stop can't flash green.
+        if case .clear = pending { return }
+
         switch result {
-        case .success:
+        case .success(let applied):
             simulated = coordinate
             pin = coordinate
+            activePort = applied.port
+            confirmedTunnelIP = TunnelConfig.targetIP
+            provenTunnelIPs.insert(TunnelConfig.targetIP)
+            consecutiveFailures = 0
+            dropNotified = false
             status = .active
-            lastError = nil
+            if source == .user {
+                lastError = nil
+            }
             beginBackground()
             locationKeeper.start()
             startResend(pairing: pairing)
-            startHealth(pairing: pairing)
             if markRecent {
                 pushRecent(coordinate)
             }
         case .failure(let error):
-            lastError = error.localizedDescription
-            if simulated != nil {
-                status = .dropped(error.localizedDescription)
-                postDropNotification(error.localizedDescription)
-            } else {
+            // Only a user gesture may raise the alert; a failing 8s resend would otherwise
+            // pop a modal every 8 seconds.
+            if source == .user {
+                lastError = error.localizedDescription
+            }
+            // A tunnel-layer refusal disproves reachability. A failure further up the
+            // chain (RSD, simulation, set) still proves the tunnel itself answered, so
+            // it must not retract the evidence.
+            switch error {
+            case .tunnelCreate, .portUnavailable:
+                confirmedTunnelIP = nil
+            default:
+                break
+            }
+            if simulated == nil {
+                // Nothing ever came up, so there is no session to reconnect to — and the
+                // producer has to stop as well. A route left running would otherwise feed
+                // the engine a full candidate sweep per step, for the whole route, while
+                // the UI reads "Not Spoofing" and the drop threshold never trips.
+                desired = nil
+                routeTask?.cancel()
+                routeTask = nil
+                stopJoystick()
+            }
+            consecutiveFailures += 1
+            guard desired != nil else {
+                consecutiveFailures = 0
                 status = .idle
+                return
+            }
+            if consecutiveFailures >= dropThreshold {
+                status = .dropped(error.localizedDescription)
+                if !dropNotified {
+                    dropNotified = true
+                    postDropNotification(error.localizedDescription)
+                }
+            } else {
+                status = .reconnecting
             }
         }
     }
 
+    /// Stop always lands in `.idle`: the handles are freed either way and the user asked
+    /// to stop, so a failure here is worth an error but never a dropped-session badge.
+    private func runClear() async {
+        isBusy = true
+        let result = await LocationEngine.clear()
+        isBusy = false
+        desired = nil
+        simulated = nil
+        activePort = nil
+        // Reachability is evidence of a *current* tunnel, not a memory of one. Leaving
+        // this set pins the status chip to "Connected" for the life of the process.
+        confirmedTunnelIP = nil
+        consecutiveFailures = 0
+        dropNotified = false
+        status = .idle
+        endBackground()
+        // Keep location updates running so the map puck / locate button
+        // can return to the real GPS fix (not the leftover pin).
+        locationKeeper.start()
+        if case .failure(let error) = result {
+            lastError = error.localizedDescription
+        }
+    }
+
     private func tickJoystick(pairing: PairingStore) {
-        guard joystickActive, let current = simulated else { return }
+        guard joystickActive, let current = desired else { return }
         let magnitude = hypot(joystickVector.dx, joystickVector.dy)
         guard magnitude > 0.08 else { return }
         let nx = joystickVector.dx / magnitude
@@ -333,19 +449,19 @@ final class SpoofSession: ObservableObject {
         let dt = 0.25
         let meters = speed * dt
         let next = offset(coordinate: current, eastMeters: nx * meters, northMeters: ny * meters)
-        apply(next, pairing: pairing, markRecent: false)
+        request(next, pairing: pairing, markRecent: false, source: .motion)
     }
 
+    /// Re-asserts the fix every 8s — iOS drops it otherwise. It keeps firing while the
+    /// session is `.dropped`, which is also what brings a broken tunnel back.
     private func startResend(pairing: PairingStore) {
         resendTimer?.invalidate()
         resendTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                _ = LocationEngine.set(
-                    latitude: sim.latitude,
-                    longitude: sim.longitude,
-                    pairingPath: pairing.pairingPath,
-                    deviceIP: TunnelConfig.targetIP
+                guard let self, let target = self.desired else { return }
+                self.enqueue(
+                    .apply(coordinate: target, markRecent: false, source: .resend),
+                    pairing: pairing
                 )
             }
         }
@@ -354,27 +470,6 @@ final class SpoofSession: ObservableObject {
     private func stopResend() {
         resendTimer?.invalidate()
         resendTimer = nil
-    }
-
-    private func startHealth(pairing: PairingStore) {
-        healthTimer?.invalidate()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                if case .dropped = self.status {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
-                } else if !LocationEngine.isSessionActive, self.isSpoofing {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
-                }
-            }
-        }
-    }
-
-    private func stopHealth() {
-        healthTimer?.invalidate()
-        healthTimer = nil
     }
 
     private func pushRecent(_ coordinate: CLLocationCoordinate2D) {
