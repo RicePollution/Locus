@@ -132,6 +132,25 @@ struct StatusBarView: View {
             Text(title)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            // The limit takes the coordinate's slot rather than sitting beside it: both at
+            // once does not fit a phone-width chip, and while a route is running the limit
+            // is the number that is changing.
+            if case .active = session.status, let limit = session.currentSpeedLimit {
+                Text("· \(limit.displayText)")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(LocusTheme.accent)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                if !limit.roadName.isEmpty {
+                    Text("· \(limit.roadName)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
 
             Spacer(minLength: 8)
 
@@ -139,7 +158,9 @@ struct StatusBarView: View {
                 Image(systemName: "lock.shield.fill")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(LocusTheme.accent)
-            } else if case .active = session.status, let sim = session.simulated {
+            } else if case .active = session.status,
+                      session.currentSpeedLimit == nil,
+                      let sim = session.simulated {
                 Text(String(format: "%.4f, %.4f", sim.latitude, sim.longitude))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)

@@ -11,6 +11,7 @@ struct SettingsView: View {
     @State private var showNameEasterEgg = false
     @State private var tunnelIP = TunnelConfig.targetIP
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
+    @State private var useSpeedLimits = SpeedLimitSettings.isEnabled
     @Environment(\.scenePhase) private var scenePhase
 
     private var supportsOnDevicePairing: Bool {
@@ -118,8 +119,19 @@ struct SettingsView: View {
                     Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row.")
                 }
 
+                Section {
+                    Toggle("Use posted speed limits", isOn: $useSpeedLimits)
+                        .onChange(of: useSpeedLimits) { _, value in
+                            SpeedLimitSettings.setEnabled(value)
+                        }
+                } header: {
+                    Text("Driving")
+                } footer: {
+                    Text("Driving routes follow the posted limit for each road instead of one fixed speed, using OpenStreetMap data. Building a driving route sends the route's shape — a list of coordinates along it — to overpass-api.de, a free server run by volunteers. Stretches of the route that pass within 500 m of the position Locus has for your device are left out and never sent; those stretches use the fallback speed instead. That position is a coarse fix, and while a spoof is running Locus uses the last one it had before the spoof started. The server still sees your IP address and a User-Agent saying the request came from Locus. There is no account, no identifier, and nothing else is sent. A failed lookup never stops a route; it drives at the old fixed speed.")
+                }
+
                 Section("Privacy") {
-                    Text("Fully on-device. Favorites and recents stay in UserDefaults. No analytics, no accounts, nothing uploaded.")
+                    Text("On-device by default. Favorites and recents stay in UserDefaults. No analytics, no accounts. The one exception is posted speed limits: with that setting on, building a driving route sends the route's shape to overpass-api.de. Stretches passing within 500 m of the position Locus has for your device are withheld, but the server does see your IP address and that the request came from Locus. Turn the setting off under Driving to send nothing at all.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -128,6 +140,11 @@ struct SettingsView: View {
                     LabeledContent("Version", value: appVersion)
                     LabeledContent("Engine", value: "idevice DVT location simulation")
                     Text("Locus is free and open source (MIT). Location injection uses the MIT-licensed idevice FFI.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    // The ODbL requires the attribution wherever the data is used; the
+                    // Overpass response body carries the same notice.
+                    Text("Speed limit data © OpenStreetMap contributors, available under the ODbL.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
