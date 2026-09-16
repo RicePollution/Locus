@@ -33,6 +33,13 @@ struct MapHomeView: View {
     /// Set after a route is built, imported, or taken from a drawing, so the planner
     /// can confirm a route actually exists. Nil means "no route loaded".
     @State private var routeStatus: String?
+    /// The posted-limit lookup for the selected route, held so reselecting or rebuilding can
+    /// abandon it. Nil means nothing is in flight.
+    @State private var speedLookupTask: Task<Void, Never>?
+    /// Profile for the route currently drawn, once its lookup has landed.
+    @State private var activeProfile: SpeedProfile?
+    /// What the planner says about posted limits for the selected route.
+    @State private var speedLimitStatus: String?
     @State private var isRouting = false
     @State private var showRouteSheet = false
     @State private var showGPXImporter = false
@@ -183,6 +190,7 @@ struct MapHomeView: View {
                 status: routeStatus,
                 errorText: routeError,
                 isStale: routeIsStale,
+                speedLimitStatus: speedLimitStatus,
                 resolvedStart: resolvedRouteStart,
                 candidates: routeCandidates,
                 selectedRouteID: selectedRouteID,
@@ -605,7 +613,82 @@ struct MapHomeView: View {
         // are not the same. Claiming the first as ours would be a promise the follower
         // does not keep.
         routeStatus = "Route ready — \(parts.joined(separator: ", ")) (Maps estimate). Tap Follow route."
+        startSpeedLimitLookup(for: route)
         return true
+    }
+
+    /// Longest a Follow will wait for an in-flight limit lookup before starting anyway.
+    private static let followProfileDeadline: TimeInterval = 3
+
+    /// Ask Overpass for this route's posted limits. Deliberately hung off the point where a
+    /// route becomes the active one rather than off the build: the route is drawn, framed and
+    /// followable before a single byte leaves the device, and nothing here can block that.
+    private func startSpeedLimitLookup(for route: RoadRoute) {
+        speedLookupTask?.cancel()
+        speedLookupTask = nil
+        activeProfile = route.speedProfile
+        let mode = session.travelMode
+        guard mode == .drive else {
+            speedLimitStatus = nil
+            return
+        }
+        guard SpeedLimitSettings.isEnabled else {
+            speedLimitStatus = "Speed limits: off"
+            return
+        }
+        if let profile = route.speedProfile {
+            speedLimitStatus = Self.speedLimitSummary(for: profile)
+            return
+        }
+        speedLimitStatus = "Speed limits: looking up…"
+        let routeID = route.id
+        speedLookupTask = Task {
+            let outcome = await SpeedLimitService.shared.profile(for: route, mode: mode)
+            if Task.isCancelled { return }
+            install(outcome, forRouteID: routeID)
+        }
+    }
+
+    /// A profile describes one specific polyline, so it may only be attached to the candidate
+    /// it was looked up for — a rebuild while it was in flight has already retired that id,
+    /// and a reselect has moved the selection off it.
+    private func install(_ outcome: SpeedLimitService.Outcome, forRouteID id: RoadRoute.ID) {
+        guard let index = routeCandidates.firstIndex(where: { $0.id == id }) else { return }
+        if case .profile(let profile) = outcome {
+            routeCandidates[index].speedProfile = profile
+        }
+        guard id == selectedRouteID else { return }
+        speedLookupTask = nil
+        switch outcome {
+        case .profile(let profile):
+            activeProfile = profile
+            speedLimitStatus = Self.speedLimitSummary(for: profile)
+        case .disabled:
+            speedLimitStatus = "Speed limits: off"
+        case .notApplicable(let reason):
+            speedLimitStatus = "Speed limits: \(reason)"
+        case .unavailable(let reason):
+            // Name what it falls back to. "Unavailable" on its own reads as "the route will
+            // not play", which is the one thing that is never true here.
+            let fallback = routeCandidates[index].averageSpeed != nil
+                ? "using route average"
+                : "using the travel mode's speed"
+            speedLimitStatus = "Speed limits: unavailable — \(reason), \(fallback)"
+        }
+    }
+
+    private static func speedLimitSummary(for profile: SpeedProfile) -> String {
+        let count = profile.zones.count
+        var parts = [
+            "\(count) zone\(count == 1 ? "" : "s")",
+            "\(Int((profile.postedCoverage * 100).rounded()))% posted"
+        ]
+        // Shown next to MapKit's ETA rather than instead of it: the two will differ, and a
+        // user who notices deserves the number rather than a surprise.
+        if let implied = RouteFormat.duration(profile.impliedDuration) {
+            parts.append("~\(implied)")
+        }
+        return "Speed limits: " + parts.joined(separator: " · ")
     }
 
     /// Put the whole route on screen once it is built. A route that starts off-camera
@@ -635,6 +718,10 @@ struct MapHomeView: View {
     private func clearRouteCandidates() {
         routeCandidates = []
         selectedRouteID = nil
+        speedLookupTask?.cancel()
+        speedLookupTask = nil
+        activeProfile = nil
+        speedLimitStatus = nil
     }
 
     private func playRoute() {
@@ -647,7 +734,37 @@ struct MapHomeView: View {
         // one now being followed, yanking the camera to a path the user is not on.
         cancelRouteBuild()
         showRouteSheet = false
-        session.followRoute(path, pairing: pairing)
+        // A posted car limit is not a pedestrian's speed, so a mode switched away from
+        // driving after the build must not inherit the profile the build looked up.
+        guard session.travelMode == .drive else {
+            session.followRoute(path, pairing: pairing)
+            return
+        }
+        let stopMark = session.stopGeneration
+        Task {
+            await awaitProfileBriefly()
+            // Stop tapped during the wait had no routeTask to cancel, so without this the
+            // follow it was cancelling would start behind it.
+            guard session.stopGeneration == stopMark else { return }
+            session.followRoute(path, profile: activeProfile, pairing: pairing)
+        }
+    }
+
+    /// Give an in-flight lookup a moment to land before starting.
+    ///
+    /// Build-then-Follow inside a second or two is the common gesture, and without this the
+    /// first follow of a route silently runs at the old fixed speed while the profile lands
+    /// behind it — which reads as the feature not working. Polling rather than racing the
+    /// task: `Task<Void, Never>.value` is not cancellation-aware, so a task group would wait
+    /// for the lookup on the way out and the deadline would do nothing.
+    ///
+    /// The deadline expiring does NOT cancel the lookup: it keeps running and still installs,
+    /// so the next Follow of this route is correct from cache.
+    private func awaitProfileBriefly() async {
+        let deadline = Date().addingTimeInterval(Self.followProfileDeadline)
+        while activeProfile == nil, speedLookupTask != nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 
     private func importGPX(_ url: URL, reopenPlanner: Bool) {

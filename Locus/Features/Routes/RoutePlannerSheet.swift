@@ -15,6 +15,10 @@ struct RoutePlannerSheet: View {
     var errorText: String?
     /// True when an endpoint has changed since the loaded route was built.
     var isStale: Bool
+    /// What posted limits are doing for the loaded route — looking up, how many zones and
+    /// how much of it is real posted data, or why there are none. Nil when the concept does
+    /// not apply, which is every travel mode but driving.
+    var speedLimitStatus: String?
     /// What the route will actually start from, including the implicit "wherever you are"
     /// when `start` is nil. Shown rather than silently used, since a route from the wrong
     /// place is the failure that is hardest to spot on a map.
@@ -53,11 +57,18 @@ struct RoutePlannerSheet: View {
                     }
                 }
 
-                if let status {
+                if status != nil || speedLimitStatus != nil {
                     Section {
-                        Label(status, systemImage: "checkmark.circle.fill")
-                            .font(.footnote)
-                            .foregroundStyle(LocusTheme.statusGood)
+                        if let status {
+                            Label(status, systemImage: "checkmark.circle.fill")
+                                .font(.footnote)
+                                .foregroundStyle(LocusTheme.statusGood)
+                        }
+                        if let speedLimitStatus {
+                            Label(speedLimitStatus, systemImage: "speedometer")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 
@@ -138,10 +149,7 @@ struct RoutePlannerSheet: View {
                 }
 
                 Section {
-                    Text("Routes come from Apple Maps directions for the selected travel mode. "
-                         + "Alternates are ranked by travel time, so the top one is the route "
-                         + "Maps would suggest. Speed gets light random variation so motion "
-                         + "looks less robotic.")
+                    Text(explainer)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -153,6 +161,18 @@ struct RoutePlannerSheet: View {
                 }
             }
         }
+    }
+
+    private var explainer: String {
+        var text = "Routes come from Apple Maps directions for the selected travel mode. "
+            + "Alternates are ranked by travel time, so the top one is the route Maps would "
+            + "suggest. Speed gets light random variation so motion looks less robotic."
+        if SpeedLimitSettings.isEnabled {
+            text += " Driving routes also follow each road's posted limit, looked up from "
+                + "OpenStreetMap after the route is drawn — never before, so it can never "
+                + "hold a route up."
+        }
+        return text
     }
 
     private func routeRow(_ route: RoadRoute, isFastest: Bool) -> some View {

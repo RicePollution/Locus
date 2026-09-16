@@ -11,6 +11,7 @@ struct SettingsView: View {
     @State private var showNameEasterEgg = false
     @State private var tunnelIP = TunnelConfig.targetIP
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
+    @State private var useSpeedLimits = SpeedLimitSettings.isEnabled
     @Environment(\.scenePhase) private var scenePhase
 
     private var supportsOnDevicePairing: Bool {
@@ -118,8 +119,19 @@ struct SettingsView: View {
                     Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row.")
                 }
 
+                Section {
+                    Toggle("Use posted speed limits", isOn: $useSpeedLimits)
+                        .onChange(of: useSpeedLimits) { _, value in
+                            SpeedLimitSettings.setEnabled(value)
+                        }
+                } header: {
+                    Text("Driving")
+                } footer: {
+                    Text("Driving routes follow the posted limit for each road instead of one fixed speed, using OpenStreetMap data. Building a driving route sends that route's shape to overpass-api.de, a free community server — nothing else, and nothing that identifies you. A failed lookup never stops a route; it just drives at the old fixed speed.")
+                }
+
                 Section("Privacy") {
-                    Text("Fully on-device. Favorites and recents stay in UserDefaults. No analytics, no accounts, nothing uploaded.")
+                    Text("On-device by default. Favorites and recents stay in UserDefaults. No analytics, no accounts. The one exception is posted speed limits: if that setting is on, building a driving route sends the route's shape to overpass-api.de.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -128,6 +140,11 @@ struct SettingsView: View {
                     LabeledContent("Version", value: appVersion)
                     LabeledContent("Engine", value: "idevice DVT location simulation")
                     Text("Locus is free and open source (MIT). Location injection uses the MIT-licensed idevice FFI.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    // The ODbL requires the attribution wherever the data is used; the
+                    // Overpass response body carries the same notice.
+                    Text("Speed limit data © OpenStreetMap contributors, available under the ODbL.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

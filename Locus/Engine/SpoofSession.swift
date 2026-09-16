@@ -84,6 +84,16 @@ final class SpoofSession: ObservableObject {
     /// moved because playback is moving it" — those look identical from the outside and
     /// mean opposite things.
     @Published private(set) var isFollowingRoute = false
+    /// The limit in force at the current step, or nil when no route is running. Assigned
+    /// only when the value actually changes — the follower steps ~3×/s and a zone boundary
+    /// arrives perhaps twice a minute, so an unconditional assignment would redraw the
+    /// status chrome 180 times per useful update.
+    @Published private(set) var currentSpeedLimit: SpeedReading?
+    /// Bumped on every Stop. A Follow can be waiting on a speed-limit lookup when Stop is
+    /// tapped, and at that moment there is no `routeTask` for Stop to cancel — so the follow
+    /// that gesture was cancelling would start behind it. Comparing this across the wait is
+    /// what lets the caller close that window.
+    private(set) var stopGeneration = 0
 
     /// Tunnel IP the engine has actually reached, and the port it reached it on.
     @Published private(set) var confirmedTunnelIP: String?
@@ -155,6 +165,7 @@ final class SpoofSession: ObservableObject {
     }
 
     func stop(pairing: PairingStore) {
+        stopGeneration += 1
         routeTask?.cancel()
         routeTask = nil
         isFollowingRoute = false
@@ -208,12 +219,19 @@ final class SpoofSession: ObservableObject {
         joystickTimer = nil
     }
 
-    func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
+    /// `profile` defaults to nil so the GPX and drawn-path call sites need no change, and so
+    /// a route that outran its speed-limit lookup still follows — at the old fixed speed.
+    func followRoute(
+        _ coordinates: [CLLocationCoordinate2D],
+        profile: SpeedProfile? = nil,
+        pairing: PairingStore
+    ) {
         guard pairing.hasPairingFile, coordinates.count >= 2 else { return }
         routeTask?.cancel()
         stopJoystick()
         let mode = travelMode
         isFollowingRoute = true
+        currentSpeedLimit = nil
         routeGeneration += 1
         let generation = routeGeneration
         routeTask = Task { [weak self] in
@@ -222,48 +240,28 @@ final class SpoofSession: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self, self.routeGeneration == generation else { return }
                     self.isFollowingRoute = false
+                    self.currentSpeedLimit = nil
                 }
             }
-            var previous = coordinates[0]
             await MainActor.run {
-                self.request(previous, pairing: pairing, markRecent: true, source: .user)
+                self.request(coordinates[0], pairing: pairing, markRecent: true, source: .user)
             }
-            for next in coordinates.dropFirst() {
+            // The pacer owns the profile by value, so a lookup that installs a different one
+            // mid-run cannot mutate what this Task is walking.
+            var pacer = RoutePacer(coordinates: coordinates, profile: profile, mode: mode)
+            while let step = pacer.next() {
                 if Task.isCancelled { break }
-                let distance = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
-                    .distance(from: CLLocation(latitude: next.latitude, longitude: next.longitude))
-                var speed = mode.baseSpeed * Double.random(in: 0.88...1.12)
-                speed = max(0.8, speed)
-                let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
-                let steps = max(1, Int(ceil(distance / stepMeters)))
-                // Pace off the step actually taken, not the nominal one. A leg shorter
-                // than stepMeters still costs exactly one step, and charging it the full
-                // stepMeters / speed made it wait for a distance it never travelled — a
-                // hand-drawn path, whose legs are mostly a metre or two, crawled at a
-                // small fraction of the mode's speed. The floor guards against a
-                // duplicate track point — every GPS recorder emits them while the device
-                // sits still — spinning the loop with no delay at all. It is also a 20 Hz
-                // cap: a leg under ~0.7 m at drive speed plays slightly slow. Road routes
-                // never reach it (their steps are 4–12 m), and the engine cannot apply
-                // fixes that fast anyway.
-                let delay = max(0.05, (distance / Double(steps)) / speed)
-                for i in 1...steps {
-                    if Task.isCancelled { break }
-                    let t = Double(i) / Double(steps)
-                    let coord = CLLocationCoordinate2D(
-                        latitude: previous.latitude + (next.latitude - previous.latitude) * t,
-                        longitude: previous.longitude + (next.longitude - previous.longitude) * t
-                    )
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    // try? swallows the CancellationError, so re-check: without this the
-                    // step after a Stop still runs, and its apply can be drained after the
-                    // clear completes and quietly restart the whole session.
-                    if Task.isCancelled { break }
-                    await MainActor.run {
-                        self.request(coord, pairing: pairing, markRecent: false, source: .motion)
+                try? await Task.sleep(nanoseconds: UInt64(step.delay * 1_000_000_000))
+                // try? swallows the CancellationError, so re-check: without this the
+                // step after a Stop still runs, and its apply can be drained after the
+                // clear completes and quietly restart the whole session.
+                if Task.isCancelled { break }
+                await MainActor.run {
+                    if self.currentSpeedLimit != step.reading {
+                        self.currentSpeedLimit = step.reading
                     }
+                    self.request(step.coordinate, pairing: pairing, markRecent: false, source: .motion)
                 }
-                previous = next
             }
         }
     }
@@ -438,6 +436,7 @@ final class SpoofSession: ObservableObject {
                 routeTask?.cancel()
                 routeTask = nil
                 isFollowingRoute = false
+                currentSpeedLimit = nil
                 stopJoystick()
             }
             consecutiveFailures += 1
@@ -466,6 +465,7 @@ final class SpoofSession: ObservableObject {
         isBusy = false
         desired = nil
         simulated = nil
+        currentSpeedLimit = nil
         activePort = nil
         // Reachability is evidence of a *current* tunnel, not a memory of one. Leaving
         // this set pins the status chip to "Connected" for the life of the process.

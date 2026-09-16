@@ -29,6 +29,13 @@ struct RoadRoute: Identifiable {
     /// Set when footpath directions were not used and road directions were followed
     /// instead. Nil means the route is what was asked for.
     var fallback: RouteFallback?
+    /// Posted-limit profile for `coordinates`, or nil when limits are off, not applicable,
+    /// or not (yet) available. Never populated for anything but `.drive`.
+    ///
+    /// It lives on `RoadRoute` rather than beside it so that the profile and the geometry it
+    /// was matched against cannot be separated by a copy, and because `id` is a `let UUID`
+    /// the struct can be updated in place in `routeCandidates` without losing its identity.
+    var speedProfile: SpeedProfile?
 
     /// Average speed Apple's routing engine implies for this route. It already accounts
     /// for limits, junctions, and — for automobile routes with a departure date —
