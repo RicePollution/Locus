@@ -149,12 +149,12 @@ struct SpeedProfile {
                 )
                 continue
             }
-            if merged.count == 1, zone.start - last.start < Self.minZoneLength {
-                // Nothing precedes the opening zone for it to merge into, so the incoming
-                // zone claims the start instead. Dropping it would move `start` off 0.
-                merged[0] = Zone(start: last.start, speed: zone.speed, source: zone.source, roadName: zone.roadName)
-                continue
-            }
+            // Only reachable while `merged` is just the opening zone, since the loop above
+            // has already retired any other short tail. The opening runs on through it, the
+            // same "merge into the preceding zone" rule as everywhere else. Letting the
+            // incoming zone claim the start instead made a *run* of short opening zones end
+            // up with the last one's speed, which is nobody's reading of the data.
+            if zone.start - last.start < Self.minZoneLength { continue }
             merged.append(zone)
         }
         zones = merged

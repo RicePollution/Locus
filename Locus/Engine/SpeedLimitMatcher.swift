@@ -2,13 +2,21 @@ import CoreLocation
 import Foundation
 
 /// Matches a route polyline against the OSM ways around it and folds the result into a
-/// `SpeedProfile`. Pure and synchronous; the actor that calls it owns the off-main-actor
-/// guarantee.
+/// `SpeedProfile`. Pure, synchronous and deterministic; the actor that calls it owns the
+/// off-main-actor guarantee.
 enum SpeedLimitMatcher {
     /// Perpendicular distance at which a way is close enough to be the road we are on.
     static let matchRadius: CLLocationDistance = 20
-    /// Grid cell side. Exactly `2 * matchRadius`, which is what makes a 3×3 neighbourhood
-    /// provably contain every segment within `matchRadius` of a point in the centre cell.
+    /// Douglas–Peucker tolerance the query polyline is decimated at, and the point budget it
+    /// has to fit. They live beside `matchRadius` rather than in the service because
+    /// `queryRadius(forTolerance:)` binds all three together, and someone tuning one number
+    /// has to be looking at the other two.
+    static let decimationTolerance: CLLocationDistance = 8
+    static let decimationLimit = 2_000
+    /// Grid cell side. A pure space/time tradeoff and nothing more: `Segments.append`
+    /// inflates each segment's bounding box by `matchRadius` before inserting it, so every
+    /// segment within `matchRadius` of a point is already registered in that point's own
+    /// cell and the per-point scan reads one cell rather than a 3×3 neighbourhood.
     static let cellSize: CLLocationDistance = 40
     /// Longest way segment carried into the grid. Anything longer is subdivided so that
     /// insertion cost stays O(few cells) with no special case for a 2 km rural straight.
@@ -27,29 +35,85 @@ enum SpeedLimitMatcher {
     /// segment would otherwise subdivide into millions of pieces before anything noticed.
     static let maxSegments = 400_000
 
+    /// Corridor radius the Overpass query must use for a polyline decimated at `tolerance`.
+    ///
+    /// The query is built from the *decimated* polyline while the matcher works on the full
+    /// one, and a full-polyline point can sit up to `tolerance` from the decimated line. A
+    /// way within `matchRadius` of a route point is therefore only guaranteed to be inside
+    /// the corridor when `radius >= matchRadius + tolerance`. `decimate` widens its tolerance
+    /// when a route will not fit the point budget, which is exactly why this is a function of
+    /// the tolerance actually achieved: a constant 30 stops covering the polyline the moment
+    /// one doubling takes the tolerance past 10, and the uncovered stretches then fall
+    /// silently through to the route average with nothing to say so.
+    static func queryRadius(forTolerance tolerance: CLLocationDistance) -> Int {
+        Int((matchRadius + tolerance).rounded(.up))
+    }
+
+    /// A decimated polyline together with the tolerance it actually cost.
+    struct Decimated {
+        let coordinates: [CLLocationCoordinate2D]
+        let tolerance: CLLocationDistance
+    }
+
     /// Douglas–Peucker. Keeps the corridor on the road: the algorithm's own error metric is
     /// perpendicular deviation, which is precisely what Overpass's `around` measures.
     ///
     /// Over-budget results widen the tolerance rather than truncating the list. Cutting the
     /// tail off is the one thing that must not happen here — the query would then cover
-    /// everything but the end of the route.
+    /// everything but the end of the route. The tolerance reached comes back with the points
+    /// because the corridor radius has to be derived from it.
     static func decimate(
         _ coordinates: [CLLocationCoordinate2D],
         tolerance: CLLocationDistance,
         limit: Int
-    ) -> [CLLocationCoordinate2D] {
-        guard coordinates.count > 2, limit >= 2 else { return coordinates }
-        let projection = Projection(origin: coordinates[0])
-        let xs = coordinates.map { projection.x($0.longitude) }
-        let ys = coordinates.map { projection.y($0.latitude) }
-
-        var currentTolerance = max(tolerance, 0.5)
-        var kept = simplify(xs: xs, ys: ys, tolerance: currentTolerance)
-        while kept.count > limit, currentTolerance < 200_000 {
-            currentTolerance *= 2
-            kept = simplify(xs: xs, ys: ys, tolerance: currentTolerance)
+    ) -> Decimated {
+        // A non-finite coordinate reaching `Int(floor(x / cellSize))` or the cache key's
+        // `Int(lat * 100_000)` traps rather than misbehaves, and provenance is the only thing
+        // keeping one out today.
+        let finite = coordinates.filter {
+            $0.latitude.isFinite && $0.longitude.isFinite
+                && abs($0.latitude) <= 90 && abs($0.longitude) <= 180
         }
-        return kept.map { coordinates[$0] }
+        guard finite.count > 2, limit >= 2 else { return Decimated(coordinates: finite, tolerance: tolerance) }
+        let projection = Projection(origin: finite[0])
+        let xs = finite.map { projection.x($0.longitude) }
+        let ys = finite.map { projection.y($0.latitude) }
+
+        var achieved = max(tolerance, 0.5)
+        var kept = simplify(xs: xs, ys: ys, tolerance: achieved)
+        while kept.count > limit, achieved < 200_000 {
+            achieved *= 2
+            kept = simplify(xs: xs, ys: ys, tolerance: achieved)
+        }
+        return Decimated(coordinates: kept.map { finite[$0] }, tolerance: achieved)
+    }
+
+    /// Cumulative arc length along a polyline, in the one metric both this matcher and
+    /// `RoutePacer` use.
+    ///
+    /// They have to agree exactly. The profile keys its zones by distance and the pacer walks
+    /// by distance, so a metric that disagrees by even a percent puts every zone boundary a
+    /// few hundred metres off by the end of a long route. Flat equirectangular rather than
+    /// `CLLocation.distance(from:)` because the pacer builds this on the main actor when a
+    /// Follow starts, and two object allocations per point over 20,000 points is tens of
+    /// milliseconds of stall before anything moves.
+    static func arcLengths(_ coordinates: [CLLocationCoordinate2D]) -> [CLLocationDistance] {
+        var lengths = [CLLocationDistance](repeating: 0, count: coordinates.count)
+        guard coordinates.count > 1 else { return lengths }
+        let projection = Projection(origin: coordinates[0])
+        var previousX = projection.x(coordinates[0].longitude)
+        var previousY = projection.y(coordinates[0].latitude)
+        for index in 1..<coordinates.count {
+            let x = projection.x(coordinates[index].longitude)
+            let y = projection.y(coordinates[index].latitude)
+            let leg = ((x - previousX) * (x - previousX) + (y - previousY) * (y - previousY)).squareRoot()
+            // A non-finite leg would poison every distance after it, and this array has to
+            // stay finite and monotonic for the zone lookup and the pacer's arithmetic.
+            lengths[index] = lengths[index - 1] + (leg.isFinite ? leg : 0)
+            previousX = x
+            previousY = y
+        }
+        return lengths
     }
 
     static func profile(
@@ -69,15 +133,7 @@ enum SpeedLimitMatcher {
             )
         }
 
-        // Arc length along the route in the same metric the pacer walks it with, so a zone
-        // boundary lands where the follower thinks it is. Everything else in this file is
-        // projected metres; this one is not, because it crosses into the pacer.
-        var cumulative = [CLLocationDistance](repeating: 0, count: route.count)
-        for index in 1..<route.count {
-            let previous = CLLocation(latitude: route[index - 1].latitude, longitude: route[index - 1].longitude)
-            let current = CLLocation(latitude: route[index].latitude, longitude: route[index].longitude)
-            cumulative[index] = cumulative[index - 1] + previous.distance(from: current)
-        }
+        let cumulative = arcLengths(route)
         let routeLength = cumulative[route.count - 1]
 
         let projection = Projection(origin: route[0])
@@ -158,37 +214,35 @@ enum SpeedLimitMatcher {
         for index in 0..<rx.count {
             let px = rx[index]
             let py = ry[index]
+            // `Int(floor(nan))` traps. An unmatched point is a state the fallback chain
+            // already covers, so a junk coordinate takes that path instead.
+            guard px.isFinite, py.isFinite else { continue }
             let bearing = routeBearing(rx: rx, ry: ry, at: index)
-            let cx = Int(floor(px / cellSize))
-            let cy = Int(floor(py / cellSize))
+            let cell = Segments.cellKey(Int(floor(px / cellSize)), Int(floor(py / cellSize)))
+            guard let bucket = segments.grid[cell] else { continue }
+
             var bestScore = Double.greatestFiniteMagnitude
             var best: Int32 = -1
-
-            for dx in -1...1 {
-                for dy in -1...1 {
-                    guard let bucket = segments.grid[Segments.cellKey(cx + dx, cy + dy)] else { continue }
-                    for packed in bucket {
-                        let segment = Int(packed)
-                        let distanceSquared = pointSegmentDistanceSquared(
-                            px: px, py: py,
-                            ax: segments.x0[segment], ay: segments.y0[segment],
-                            bx: segments.x1[segment], by: segments.y1[segment]
-                        )
-                        guard distanceSquared <= radiusSquared else { continue }
-                        let segmentBearing = bearingDegrees(
-                            dx: segments.x1[segment] - segments.x0[segment],
-                            dy: segments.y1[segment] - segments.y0[segment]
-                        )
-                        guard foldedBearingDifference(bearing, segmentBearing) <= maxBearingDifference else { continue }
-                        // sqrt only for candidates that already passed both gates: the
-                        // hysteresis bonus is in metres and cannot be applied to a square.
-                        var score = distanceSquared.squareRoot()
-                        if segments.way[segment] == previousWay { score -= hysteresisBonus }
-                        if score < bestScore {
-                            bestScore = score
-                            best = segments.way[segment]
-                        }
-                    }
+            for packed in bucket {
+                let segment = Int(packed)
+                let distanceSquared = pointSegmentDistanceSquared(
+                    px: px, py: py,
+                    ax: segments.x0[segment], ay: segments.y0[segment],
+                    bx: segments.x1[segment], by: segments.y1[segment]
+                )
+                guard distanceSquared <= radiusSquared else { continue }
+                let segmentBearing = bearingDegrees(
+                    dx: segments.x1[segment] - segments.x0[segment],
+                    dy: segments.y1[segment] - segments.y0[segment]
+                )
+                guard foldedBearingDifference(bearing, segmentBearing) <= maxBearingDifference else { continue }
+                // sqrt only for candidates that already passed both gates: the hysteresis
+                // bonus is in metres and cannot be applied to a square.
+                var score = distanceSquared.squareRoot()
+                if segments.way[segment] == previousWay { score -= hysteresisBonus }
+                if score < bestScore {
+                    bestScore = score
+                    best = segments.way[segment]
                 }
             }
 
@@ -216,9 +270,17 @@ enum SpeedLimitMatcher {
             }
             var bestID = ids[index]
             var bestCount = counts[bestID] ?? 0
-            for (id, count) in counts where count > bestCount {
-                bestID = id
-                bestCount = count
+            // Scanned in window order with a strict `>`, so the incumbent survives a tie and
+            // the earliest neighbour wins among equals. Iterating `counts` instead made the
+            // answer depend on Swift's per-process hash seed, which made this function's
+            // output differ between launches on identical input.
+            for neighbour in lower...upper {
+                let id = ids[neighbour]
+                let count = counts[id] ?? 0
+                if count > bestCount {
+                    bestID = id
+                    bestCount = count
+                }
             }
             output[index] = bestID
         }
@@ -309,8 +371,9 @@ enum SpeedLimitMatcher {
             x1.append(bx)
             y1.append(by)
             way.append(wayIndex)
-            // Inflating the bounding box by the match radius is what lets the per-point scan
-            // read only the 3×3 neighbourhood and still see everything within the radius.
+            // Inflating the bounding box by the match radius before insertion is what makes a
+            // single-cell lookup complete: every point within `matchRadius` of this segment
+            // falls inside the inflated box, so its own cell already holds this index.
             let minX = min(ax, bx) - matchRadius
             let maxX = max(ax, bx) + matchRadius
             let minY = min(ay, by) - matchRadius

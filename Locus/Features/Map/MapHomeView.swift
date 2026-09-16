@@ -36,6 +36,9 @@ struct MapHomeView: View {
     /// The posted-limit lookup for the selected route, held so reselecting or rebuilding can
     /// abandon it. Nil means nothing is in flight.
     @State private var speedLookupTask: Task<Void, Never>?
+    /// The debounce delay in front of that lookup, held separately so a Follow can collapse
+    /// the delay without cancelling the lookup behind it.
+    @State private var lookupDebounceTask: Task<Void, Never>?
     /// Profile for the route currently drawn, once its lookup has landed.
     @State private var activeProfile: SpeedProfile?
     /// What the planner says about posted limits for the selected route.
@@ -619,6 +622,8 @@ struct MapHomeView: View {
 
     /// Longest a Follow will wait for an in-flight limit lookup before starting anyway.
     private static let followProfileDeadline: TimeInterval = 3
+    /// How long a selection has to settle before its lookup is issued.
+    private static let lookupDebounce: TimeInterval = 1
 
     /// Ask Overpass for this route's posted limits. Deliberately hung off the point where a
     /// route becomes the active one rather than off the build: the route is drawn, framed and
@@ -626,6 +631,10 @@ struct MapHomeView: View {
     private func startSpeedLimitLookup(for route: RoadRoute) {
         speedLookupTask?.cancel()
         speedLookupTask = nil
+        // Release the superseded lookup from its gate too, or it sits on `debounce.value`
+        // for a second before noticing it was cancelled.
+        lookupDebounceTask?.cancel()
+        lookupDebounceTask = nil
         activeProfile = route.speedProfile
         let mode = session.travelMode
         guard mode == .drive else {
@@ -642,8 +651,22 @@ struct MapHomeView: View {
         }
         speedLimitStatus = "Speed limits: looking up…"
         let routeID = route.id
+        // Where the device physically is, withheld from the query by the service. Read here
+        // rather than inside the Task so it describes the moment the route was selected.
+        let real = session.realCoordinate
+        // Tapping through the alternates calls this once per selection, and cancelling a
+        // URLSession task does not stop Overpass computing a query it already accepted — so
+        // three taps would cost a volunteer server three full queries. Fire when the
+        // selection settles instead. `try?`, not `try`: cancelling this task means "stop
+        // waiting and go", which is what a Follow does, so it has to return normally.
+        let debounce = Task {
+            _ = try? await Task.sleep(nanoseconds: UInt64(Self.lookupDebounce * 1_000_000_000))
+        }
+        lookupDebounceTask = debounce
         speedLookupTask = Task {
-            let outcome = await SpeedLimitService.shared.profile(for: route, mode: mode)
+            await debounce.value
+            if Task.isCancelled { return }
+            let outcome = await SpeedLimitService.shared.profile(for: route, mode: mode, excluding: real)
             if Task.isCancelled { return }
             install(outcome, forRouteID: routeID)
         }
@@ -720,6 +743,8 @@ struct MapHomeView: View {
         selectedRouteID = nil
         speedLookupTask?.cancel()
         speedLookupTask = nil
+        lookupDebounceTask?.cancel()
+        lookupDebounceTask = nil
         activeProfile = nil
         speedLimitStatus = nil
     }
@@ -746,7 +771,10 @@ struct MapHomeView: View {
             // Stop tapped during the wait had no routeTask to cancel, so without this the
             // follow it was cancelling would start behind it.
             guard session.stopGeneration == stopMark else { return }
-            session.followRoute(path, profile: activeProfile, pairing: pairing)
+            // The mode can also change during the wait, which is the same case the guard
+            // above this Task covers for the gesture itself.
+            let profile = session.travelMode == .drive ? activeProfile : nil
+            session.followRoute(path, profile: profile, pairing: pairing)
         }
     }
 
@@ -760,9 +788,19 @@ struct MapHomeView: View {
     ///
     /// The deadline expiring does NOT cancel the lookup: it keeps running and still installs,
     /// so the next Follow of this route is correct from cache.
+    ///
+    /// Timed on `ContinuousClock`, not `Date`: wall clock can step backwards — NTP, a
+    /// timezone-less clock correction after a flight — and a `Date` deadline would then hold
+    /// the Follow for however far back it stepped.
     private func awaitProfileBriefly() async {
-        let deadline = Date().addingTimeInterval(Self.followProfileDeadline)
-        while activeProfile == nil, speedLookupTask != nil, Date() < deadline {
+        // An explicit Follow is the opposite signal to rapid alternate-tapping: the user has
+        // settled on this route. Collapse the debounce rather than spending the Follow budget
+        // waiting out a delay that exists to absorb indecision. The service's minimum request
+        // interval is NOT bypassed — that one is politeness to a volunteer server, not
+        // guesswork about intent.
+        lookupDebounceTask?.cancel()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(Self.followProfileDeadline))
+        while activeProfile == nil, speedLookupTask != nil, ContinuousClock.now < deadline {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
     }

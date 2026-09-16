@@ -127,11 +127,11 @@ struct SettingsView: View {
                 } header: {
                     Text("Driving")
                 } footer: {
-                    Text("Driving routes follow the posted limit for each road instead of one fixed speed, using OpenStreetMap data. Building a driving route sends that route's shape to overpass-api.de, a free community server — nothing else, and nothing that identifies you. A failed lookup never stops a route; it just drives at the old fixed speed.")
+                    Text("Driving routes follow the posted limit for each road instead of one fixed speed, using OpenStreetMap data. Building a driving route sends the route's shape — a list of coordinates along it — to overpass-api.de, a free server run by volunteers. Any part of the route within 500 m of where your device actually is gets left out of that request, and those stretches just use the fallback speed. The server still sees your IP address and a User-Agent saying the request came from Locus. There is no account, no identifier, and nothing else is sent. A failed lookup never stops a route; it drives at the old fixed speed.")
                 }
 
                 Section("Privacy") {
-                    Text("On-device by default. Favorites and recents stay in UserDefaults. No analytics, no accounts. The one exception is posted speed limits: if that setting is on, building a driving route sends the route's shape to overpass-api.de.")
+                    Text("On-device by default. Favorites and recents stay in UserDefaults. No analytics, no accounts. The one exception is posted speed limits: with that setting on, building a driving route sends the route's shape to overpass-api.de. Coordinates within 500 m of your device's real location are excluded, but the server does see your IP address and that the request came from Locus. Turn the setting off under Driving to send nothing at all.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

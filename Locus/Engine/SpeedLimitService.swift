@@ -11,6 +11,22 @@ struct OSMWay {
     let geometry: [CLLocationCoordinate2D]
 }
 
+/// File-scope rather than nested in the actor so `OverpassRequest` can raise the same cases.
+private enum LookupFailure: Error {
+    case throttled(retryAfter: TimeInterval?)
+    case serverBusy
+    case rejected
+    case unavailable(String)
+
+    var reason: String {
+        switch self {
+        case .throttled, .serverBusy: return "server busy"
+        case .rejected: return "query rejected"
+        case .unavailable(let text): return text
+        }
+    }
+}
+
 /// Fetches and builds the posted-limit profile for a route.
 ///
 /// An `actor` rather than the `enum` namespace the rest of `Engine/` uses, so the ~100 ms
@@ -25,7 +41,8 @@ actor SpeedLimitService {
         case profile(SpeedProfile)
         /// The Settings toggle is off.
         case disabled
-        /// Structurally not applicable: wrong travel mode, or the route is over the length cap.
+        /// Structurally not applicable: wrong travel mode, the route is over the length cap,
+        /// or nothing of it may be sent.
         case notApplicable(reason: String)
         /// We tried and could not get it: offline, throttled, server error, nothing returned.
         case unavailable(reason: String)
@@ -36,17 +53,31 @@ actor SpeedLimitService {
     static let serverTimeout = 25              // the [timeout:N] inside the QL
     static let requestTimeout: TimeInterval = 30
     static let resourceTimeout: TimeInterval = 60
-    static let maxResponseBytes = 8 * 1024 * 1024
+    /// Sized against the matcher rather than against the wire: decoding and subdividing a
+    /// maximal response costs tens of megabytes of transient allocation downstream, which is
+    /// the real spike, and no legitimate route inside the length cap comes close to 2 MB.
+    static let maxResponseBytes = 2 * 1024 * 1024
     static let maxRouteLength: CLLocationDistance = 150_000
-    static let decimationTolerance: CLLocationDistance = 8      // ε
-    static let decimationLimit = 2_000
-    static let queryRadius = 30                                 // R_q, metres
     static let retryDelays: [TimeInterval] = [2, 6]
     static let throttleCooldown: TimeInterval = 60
+    /// Longest an honoured `Retry-After` may hold a lookup.
+    static let maxRetryAfter: TimeInterval = 15
+    /// Floor on the gap between two requests. Politeness, and the only *structural* bound on
+    /// how fast this app can ask a volunteer server for anything.
+    static let minimumRequestInterval: TimeInterval = 2
     static let cacheLimit = 8
+    /// No point this close to where the device physically is may be sent.
+    ///
+    /// A route's start is very often exactly that: `resolvedRouteStart` falls through to
+    /// `session.realCoordinate` when nothing is simulated yet, so a first Build would
+    /// otherwise upload the user's actual position at ~1.1 m precision next to their IP.
+    static let realLocationRadius: CLLocationDistance = 500
+    /// Most corridors one query may union. A route weaving in and out of the exclusion could
+    /// otherwise build a union of dozens of statements against a volunteer server.
+    static let maxQueryRuns = 8
 
     /// Overpass's usage policy asks for an identifying agent. `User-Agent` is not a reserved
-    /// header on iOS and is sent as written.
+    /// header on iOS and is sent as written — which also means the server knows this is Locus.
     static let userAgent: String = {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
         return "Locus/\(version) (+https://github.com/RicePollution/Locus)"
@@ -71,10 +102,17 @@ actor SpeedLimitService {
     /// Set by a second 429. Until it lapses every lookup short-circuits with no request at
     /// all, which is the whole point — a throttled server must not be asked again.
     private var cooldownUntil: Date?
+    /// Earliest instant the next request may leave. Each lookup reserves its slot with no
+    /// `await` between the read and the write, so reentrant calls queue instead of colliding.
+    ///
+    /// This is what actually bounds the request rate. Actor isolation does not: actors are
+    /// reentrant at every suspension point. `httpMaximumConnectionsPerHost = 1` does not
+    /// either — it bounds TCP connections, and HTTP/2 multiplexes requests over one. And
+    /// cancelling a `URLSessionTask` does not stop Overpass computing a query it has already
+    /// accepted, so "the user moved on" is not a reason the server stops paying for it.
+    private var nextRequestAllowedAt = Date.distantPast
 
-    /// A dedicated session, not `.shared`. `httpMaximumConnectionsPerHost = 1` is what
-    /// actually holds this app to one Overpass connection: actors are reentrant at every
-    /// `await`, so actor isolation alone does not bound requests in flight.
+    /// A dedicated session, not `.shared`.
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = SpeedLimitService.requestTimeout
@@ -88,7 +126,13 @@ actor SpeedLimitService {
         return URLSession(configuration: config)
     }()
 
-    func profile(for route: RoadRoute, mode: TravelMode) async -> Outcome {
+    /// `realCoordinate` is the device's actual position, and every point within
+    /// `realLocationRadius` of it is withheld from the query — see `runs(in:excluding:)`.
+    func profile(
+        for route: RoadRoute,
+        mode: TravelMode,
+        excluding realCoordinate: CLLocationCoordinate2D?
+    ) async -> Outcome {
         guard SpeedLimitSettings.isEnabled else { return .disabled }
         // §3.6: a posted car limit is not a pedestrian's speed, and the query asks only for
         // drivable classes, so a walking route would match nothing and waste the request.
@@ -104,24 +148,32 @@ actor SpeedLimitService {
 
         let decimated = SpeedLimitMatcher.decimate(
             route.coordinates,
-            tolerance: Self.decimationTolerance,
-            limit: Self.decimationLimit
+            tolerance: SpeedLimitMatcher.decimationTolerance,
+            limit: SpeedLimitMatcher.decimationLimit
         )
-        guard decimated.count >= 2 else {
+        // Derived from the tolerance decimation actually reached, never a constant: the
+        // corridor has to cover the full polyline, not the decimated one.
+        let radius = SpeedLimitMatcher.queryRadius(forTolerance: decimated.tolerance)
+        guard decimated.coordinates.count >= 2 else {
             return .notApplicable(reason: "this route has no path to match")
         }
+        let runs = Self.runs(in: decimated.coordinates, excluding: realCoordinate)
+        guard !runs.isEmpty else {
+            return .notApplicable(reason: "route stays too close to your real location to look up")
+        }
 
-        let key = Self.cacheKey(for: decimated)
+        let key = Self.cacheKey(for: runs, radius: radius)
         if let hit = cache.first(where: { $0.key == key })?.profile {
             return .profile(hit)
         }
         if let cooldownUntil, cooldownUntil > Date() {
             return .unavailable(reason: "server busy")
         }
+        guard await reserveRequestSlot() else { return .unavailable(reason: "cancelled") }
 
         let ways: [OSMWay]
         do {
-            ways = try Self.decodeWays(try await send(Self.query(for: decimated)))
+            ways = try Self.decodeWays(try await send(Self.query(for: runs, radius: radius)))
         } catch let failure as LookupFailure {
             return .unavailable(reason: failure.reason)
         } catch {
@@ -133,7 +185,10 @@ actor SpeedLimitService {
         let profile = SpeedLimitMatcher.profile(
             route: route.coordinates,
             ways: ways,
-            unit: await inferUnit(from: ways, route: route.coordinates),
+            // Inferred from the stretches that were actually queried, so the reverse-geocode
+            // fallback obeys the same exclusion the request does rather than handing the
+            // user's real position to a second service.
+            unit: await inferUnit(from: ways, sampledFrom: runs),
             fallback: fallback,
             fallbackSource: route.averageSpeed != nil ? .routeAverage : .travelMode
         )
@@ -145,22 +200,26 @@ actor SpeedLimitService {
         return .profile(profile)
     }
 
-    // MARK: - Network
-
-    private enum LookupFailure: Error {
-        case throttled(retryAfter: TimeInterval?)
-        case serverBusy
-        case rejected
-        case unavailable(String)
-
-        var reason: String {
-            switch self {
-            case .throttled, .serverBusy: return "server busy"
-            case .rejected: return "query rejected"
-            case .unavailable(let text): return text
-            }
+    /// Claims the next send slot and waits for it. False only when the wait was cancelled.
+    ///
+    /// Waiting rather than refusing: a second route selection is a legitimate gesture, and
+    /// answering it with "unavailable, try again" would leave that route without a profile
+    /// for good. A caller that has moved on cancels, and its wait dies here.
+    func reserveRequestSlot() async -> Bool {
+        let now = Date()
+        let slot = max(now, nextRequestAllowedAt)
+        nextRequestAllowedAt = slot.addingTimeInterval(Self.minimumRequestInterval)
+        let wait = min(slot.timeIntervalSince(now), 30)
+        guard wait > 0 else { return true }
+        do {
+            try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+        } catch {
+            return false
         }
+        return true
     }
+
+    // MARK: - Network
 
     private func send(_ query: String) async throws -> Data {
         var busyRetries = 0
@@ -178,7 +237,7 @@ actor SpeedLimitService {
                         cooldownUntil = Date().addingTimeInterval(Self.throttleCooldown)
                         throw failure
                     }
-                    try await Task.sleep(nanoseconds: UInt64(min(retryAfter ?? 5, 15) * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: UInt64((retryAfter ?? 5) * 1_000_000_000))
                 case .serverBusy:
                     guard busyRetries < Self.retryDelays.count else { throw failure }
                     let delay = Self.retryDelays[busyRetries] * Double.random(in: 0.75...1.25)
@@ -203,62 +262,39 @@ actor SpeedLimitService {
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         request.httpBody = Data("data=\(encoded)".utf8)
 
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            bytes.task.cancel()
-            throw LookupFailure.unavailable("unexpected response")
-        }
+        let (http, body) = try await OverpassRequest(limit: Self.maxResponseBytes)
+            .run(request, in: session)
         switch http.statusCode {
         case 200:
-            return try await Self.collect(bytes, limit: Self.maxResponseBytes)
+            return body
         case 429:
-            bytes.task.cancel()
-            throw LookupFailure.throttled(
-                retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
-            )
+            throw LookupFailure.throttled(retryAfter: Self.retryAfter(http))
+        case 300...399:
+            // The delegate refused a redirect off the endpoint's host, so the task finished
+            // holding the 3xx itself.
+            throw LookupFailure.unavailable("unexpected redirect")
         case 500...599:
             // An overloaded dispatcher answers 504 with an HTML body, twice in seven
             // requests during the design probes. Worth retrying; nothing else here is.
-            bytes.task.cancel()
             throw LookupFailure.serverBusy
         default:
             // A 4xx is our own query being wrong. Retrying our bug wastes a volunteer's
-            // cycles, so log enough to fix it and give up.
-            let body = await Self.head(bytes, limit: 500)
-            Self.log.error("Overpass rejected the query (\(http.statusCode, privacy: .public)): \(body, privacy: .public)")
+            // cycles, so log enough to fix it and give up. The body stays private: Overpass
+            // quotes the offending query back, and the query is the route corridor.
+            let text = String(decoding: body.prefix(500), as: UTF8.self)
+            Self.log.error("Overpass rejected the query (\(http.statusCode, privacy: .public)): \(text, privacy: .private)")
             throw LookupFailure.rejected
         }
     }
 
-    private static func collect(_ bytes: URLSession.AsyncBytes, limit: Int) async throws -> Data {
-        var buffer = Data()
-        buffer.reserveCapacity(64 * 1024)
-        for try await byte in bytes {
-            buffer.append(byte)
-            if buffer.count > limit {
-                // Cancelled mid-stream on purpose: checking the size once the bytes are
-                // already resident is exactly the memory spike the cap exists to prevent.
-                bytes.task.cancel()
-                throw LookupFailure.unavailable("response too large")
-            }
-        }
-        return buffer
-    }
-
-    /// First `limit` bytes of an error body, for the log. Read failures are swallowed
-    /// because the body is diagnostic only — the status code already named the failure.
-    private static func head(_ bytes: URLSession.AsyncBytes, limit: Int) async -> String {
-        var buffer = Data()
-        do {
-            for try await byte in bytes {
-                buffer.append(byte)
-                if buffer.count >= limit { break }
-            }
-        } catch {
-            // Nothing to report: a truncated body is still a usable diagnostic.
-        }
-        bytes.task.cancel()
-        return String(decoding: buffer, as: UTF8.self)
+    /// `Retry-After` is text the server chooses. `TimeInterval("nan")` and `"-1"` both parse,
+    /// and NaN survives `min` — which is `Comparable`, not IEEE — all the way into
+    /// `UInt64(_:)`, which traps. The finiteness gate has to come before the clamp, not after.
+    static func retryAfter(_ response: HTTPURLResponse) -> TimeInterval? {
+        guard let raw = response.value(forHTTPHeaderField: "Retry-After"),
+              let seconds = TimeInterval(raw),
+              seconds.isFinite, seconds >= 0 else { return nil }
+        return min(seconds, maxRetryAfter)
     }
 
     private static func reason(for error: Error) -> String {
@@ -281,22 +317,68 @@ actor SpeedLimitService {
 
     // MARK: - Query
 
+    /// The stretches of a decimated polyline that may be sent, split at the exclusion around
+    /// the device's real position.
+    ///
+    /// Excluded stretches are *not* bridged. Joining the surviving neighbours would draw the
+    /// corridor straight across the gap and query the roads around the user's home anyway,
+    /// which is the thing being prevented. Each surviving run becomes its own `around` filter
+    /// inside one union, and the dropped stretches resolve through the fallback chain exactly
+    /// like a stretch the corridor missed for any other reason.
+    static func runs(
+        in coordinates: [CLLocationCoordinate2D],
+        excluding real: CLLocationCoordinate2D?
+    ) -> [[CLLocationCoordinate2D]] {
+        guard let real, real.latitude.isFinite, real.longitude.isFinite else {
+            return coordinates.count >= 2 ? [coordinates] : []
+        }
+        let anchor = CLLocation(latitude: real.latitude, longitude: real.longitude)
+        var runs: [[CLLocationCoordinate2D]] = []
+        var current: [CLLocationCoordinate2D] = []
+        for coordinate in coordinates {
+            let point = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+            guard anchor.distance(from: point) > realLocationRadius else {
+                if current.count >= 2 { runs.append(current) }
+                current.removeAll(keepingCapacity: true)
+                continue
+            }
+            current.append(coordinate)
+        }
+        if current.count >= 2 { runs.append(current) }
+        guard runs.count > maxQueryRuns else { return runs }
+        // The shortest stretches contribute least and fall through the chain like any other
+        // gap. Kept in route order so the query reads the way the route does.
+        let kept = runs.enumerated()
+            .sorted { $0.element.count > $1.element.count }
+            .prefix(maxQueryRuns)
+            .sorted { $0.offset < $1.offset }
+        return kept.map(\.element)
+    }
+
     /// `around` with a coordinate list is a corridor around the *chord* between the points,
     /// not around the road, which is why the polyline handed in must be Douglas–Peucker
     /// decimated rather than uniformly sampled.
-    private static func query(for coordinates: [CLLocationCoordinate2D]) -> String {
+    static func query(for runs: [[CLLocationCoordinate2D]], radius: Int) -> String {
+        let filter = """
+              way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified\
+            |residential|living_street|service|motorway_link|trunk_link|primary_link\
+            |secondary_link|tertiary_link)$"]
+                ["service"!~"^(parking_aisle|driveway|drive-through|emergency_access)$"]
+                ["area"!="yes"]
+            """
         var body = "[out:json][timeout:\(serverTimeout)][maxsize:67108864];\n"
-        body += "way[\"highway\"~\"^(motorway|trunk|primary|secondary|tertiary|unclassified"
-        body += "|residential|living_street|service|motorway_link|trunk_link|primary_link"
-        body += "|secondary_link|tertiary_link)$\"]\n"
-        body += "  [\"service\"!~\"^(parking_aisle|driveway|drive-through|emergency_access)$\"]\n"
-        body += "  [\"area\"!=\"yes\"]\n"
-        body += "  (around:\(queryRadius)"
-        for coordinate in coordinates {
-            // %.5f is ~1.1 m. Finer is wasted bytes and leaks nothing useful.
-            body += String(format: ",%.5f,%.5f", coordinate.latitude, coordinate.longitude)
+        if runs.count > 1 { body += "(\n" }
+        for run in runs {
+            body += filter
+            body += "\n    (around:\(radius)"
+            for coordinate in run {
+                // %.5f is ~1.1 m. Finer is wasted bytes and leaks nothing useful.
+                body += String(format: ",%.5f,%.5f", coordinate.latitude, coordinate.longitude)
+            }
+            body += ");\n"
         }
-        body += ");\nout tags geom;"
+        if runs.count > 1 { body += ");\n" }
+        body += "out tags geom;"
         return body
     }
 
@@ -342,7 +424,7 @@ actor SpeedLimitService {
 
     /// Reads the route's own geography, never the device locale: `Locale.current` says
     /// nothing about where a spoofed route is.
-    private func inferUnit(from ways: [OSMWay], route: [CLLocationCoordinate2D]) async -> SpeedUnit {
+    private func inferUnit(from ways: [OSMWay], sampledFrom runs: [[CLLocationCoordinate2D]]) async -> SpeedUnit {
         var prefixes: [String: Int] = [:]
         var sawMilesPerHour = false
         var sawBareNumber = false
@@ -367,13 +449,15 @@ actor SpeedLimitService {
         if sawBareNumber { return .kilometresPerHour }
         // Only reachable on a route with no `maxspeed` tag anywhere, so CLGeocoder's
         // throttling is not a risk.
-        if let code = await Self.geocodedCountryCode(at: route[route.count / 2]) {
-            return SpeedUnit.forCountryCode(code)
+        guard let longest = runs.max(by: { $0.count < $1.count }), !longest.isEmpty,
+              let code = await Self.geocodedCountryCode(at: longest[longest.count / 2]) else {
+            return .kilometresPerHour
         }
-        return .kilometresPerHour
+        return SpeedUnit.forCountryCode(code)
     }
 
     private static func geocodedCountryCode(at coordinate: CLLocationCoordinate2D) async -> String? {
+        guard coordinate.latitude.isFinite, coordinate.longitude.isFinite else { return nil }
         let geocoder = CLGeocoder()
         // reverseGeocodeLocation has no timeout of its own, and a wedged request would hold
         // the whole lookup open. cancelGeocode is the only way to put a bound on it.
@@ -393,13 +477,125 @@ actor SpeedLimitService {
 
     // MARK: - Cache key
 
-    private static func cacheKey(for coordinates: [CLLocationCoordinate2D]) -> Int {
+    private static func cacheKey(for runs: [[CLLocationCoordinate2D]], radius: Int) -> Int {
         var hasher = Hasher()
-        hasher.combine(queryRadius)
-        for coordinate in coordinates {
-            hasher.combine(Int((coordinate.latitude * 100_000).rounded()))
-            hasher.combine(Int((coordinate.longitude * 100_000).rounded()))
+        hasher.combine(radius)
+        for run in runs {
+            hasher.combine(run.count)
+            for coordinate in run {
+                // decimate() has already dropped non-finite coordinates; `Int(_:)` traps on
+                // them rather than misbehaving, so this depends on that having happened.
+                hasher.combine(Int((coordinate.latitude * 100_000).rounded()))
+                hasher.combine(Int((coordinate.longitude * 100_000).rounded()))
+            }
         }
         return hasher.finalize()
+    }
+}
+
+/// One Overpass request.
+///
+/// A delegate-driven data task rather than `URLSession.bytes(for:)` for two reasons that both
+/// need the delegate: a redirect must be refused before the POST body — which is the route
+/// corridor — is replayed to whatever host the response names, and the response cap has to be
+/// applied to real chunks, since a byte-at-a-time `AsyncBytes` loop is millions of async
+/// iterations inside the actor, blocking every other lookup behind it.
+private final class OverpassRequest: NSObject, URLSessionDataDelegate {
+    private let limit: Int
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var task: URLSessionDataTask?
+    private var continuation: CheckedContinuation<(HTTPURLResponse, Data), Error>?
+    private var cancelled = false
+
+    init(limit: Int) {
+        self.limit = limit
+        super.init()
+    }
+
+    func run(_ request: URLRequest, in session: URLSession) async throws -> (HTTPURLResponse, Data) {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                guard !cancelled else {
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                let task = session.dataTask(with: request)
+                task.delegate = self
+                self.task = task
+                lock.unlock()
+                task.resume()
+            }
+        } onCancel: {
+            lock.lock()
+            cancelled = true
+            let task = self.task
+            lock.unlock()
+            task?.cancel()
+        }
+    }
+
+    private func finish(_ result: Result<(HTTPURLResponse, Data), Error>) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        // Releasing this side of the cycle is the whole fix, and it has to be this side. A
+        // task retains its delegate and this object retains the task, and ARC does not
+        // collect a cycle just because it has become unreachable — so without this every
+        // lookup leaks one request object and one URLSessionTask for the life of the
+        // process. Clearing the *task's* delegate instead is not an option: setting it after
+        // `resume()` raises NSGenericException and takes the app down. Dropping this
+        // reference is enough — the session releases the task on completion, the task then
+        // releases its delegate, and both go.
+        self.task = nil
+        lock.unlock()
+        // Nil on the second call: an overflow finishes the request before the task reports
+        // its own completion, and only the first result is the answer.
+        continuation?.resume(with: result)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        buffer.append(data)
+        let overflowed = buffer.count > limit
+        lock.unlock()
+        guard overflowed else { return }
+        // Cancelled mid-stream on purpose: a cap applied once the bytes are already resident
+        // is not a cap.
+        dataTask.cancel()
+        finish(.failure(LookupFailure.unavailable("response too large")))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            finish(.failure(error))
+            return
+        }
+        guard let http = task.response as? HTTPURLResponse else {
+            finish(.failure(LookupFailure.unavailable("unexpected response")))
+            return
+        }
+        lock.lock()
+        let body = buffer
+        lock.unlock()
+        finish(.success((http, body)))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        // A 307 or 308 replays the POST body — the route corridor — at whatever host the
+        // response names. Follow a redirect only back to the endpoint this app chose.
+        let host = request.url?.host?.lowercased()
+        let expected = SpeedLimitService.endpoint.host?.lowercased()
+        let permitted = host != nil && host == expected && request.url?.scheme == "https"
+        completionHandler(permitted ? request : nil)
     }
 }
