@@ -79,6 +79,11 @@ final class SpoofSession: ObservableObject {
     @Published var lastError: String?
     @Published var isBusy = false
     @Published var joystickActive = false
+    /// True while a route is being followed. Exposed because the planner has to tell the
+    /// difference between "the user changed their mind about the start" and "the start
+    /// moved because playback is moving it" — those look identical from the outside and
+    /// mean opposite things.
+    @Published private(set) var isFollowingRoute = false
 
     /// Tunnel IP the engine has actually reached, and the port it reached it on.
     @Published private(set) var confirmedTunnelIP: String?
@@ -118,6 +123,10 @@ final class SpoofSession: ObservableObject {
     private var resendTimer: Timer?
     private var joystickTimer: Timer?
     private var routeTask: Task<Void, Never>?
+    /// Bumped on every `followRoute`. A cancelled run's cleanup would otherwise clear
+    /// `isFollowingRoute` after its replacement had already set it, leaving the planner
+    /// convinced nothing is playing while a route runs.
+    private var routeGeneration = 0
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
     private var joystickVector: CGVector = .zero
     private let locationKeeper = BackgroundKeepAlive()
@@ -148,6 +157,7 @@ final class SpoofSession: ObservableObject {
     func stop(pairing: PairingStore) {
         routeTask?.cancel()
         routeTask = nil
+        isFollowingRoute = false
         stopJoystick()
         stopResend()
         // Drop the intent before the clear lands so an in-flight apply can't re-arm it.
@@ -203,8 +213,17 @@ final class SpoofSession: ObservableObject {
         routeTask?.cancel()
         stopJoystick()
         let mode = travelMode
+        isFollowingRoute = true
+        routeGeneration += 1
+        let generation = routeGeneration
         routeTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                Task { @MainActor [weak self] in
+                    guard let self, self.routeGeneration == generation else { return }
+                    self.isFollowingRoute = false
+                }
+            }
             var previous = coordinates[0]
             await MainActor.run {
                 self.request(previous, pairing: pairing, markRecent: true, source: .user)
@@ -217,6 +236,17 @@ final class SpoofSession: ObservableObject {
                 speed = max(0.8, speed)
                 let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
                 let steps = max(1, Int(ceil(distance / stepMeters)))
+                // Pace off the step actually taken, not the nominal one. A leg shorter
+                // than stepMeters still costs exactly one step, and charging it the full
+                // stepMeters / speed made it wait for a distance it never travelled — a
+                // hand-drawn path, whose legs are mostly a metre or two, crawled at a
+                // small fraction of the mode's speed. The floor guards against a
+                // duplicate track point — every GPS recorder emits them while the device
+                // sits still — spinning the loop with no delay at all. It is also a 20 Hz
+                // cap: a leg under ~0.7 m at drive speed plays slightly slow. Road routes
+                // never reach it (their steps are 4–12 m), and the engine cannot apply
+                // fixes that fast anyway.
+                let delay = max(0.05, (distance / Double(steps)) / speed)
                 for i in 1...steps {
                     if Task.isCancelled { break }
                     let t = Double(i) / Double(steps)
@@ -224,7 +254,6 @@ final class SpoofSession: ObservableObject {
                         latitude: previous.latitude + (next.latitude - previous.latitude) * t,
                         longitude: previous.longitude + (next.longitude - previous.longitude) * t
                     )
-                    let delay = stepMeters / speed
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     // try? swallows the CancellationError, so re-check: without this the
                     // step after a Stop still runs, and its apply can be drained after the
@@ -408,6 +437,7 @@ final class SpoofSession: ObservableObject {
                 desired = nil
                 routeTask?.cancel()
                 routeTask = nil
+                isFollowingRoute = false
                 stopJoystick()
             }
             consecutiveFailures += 1
