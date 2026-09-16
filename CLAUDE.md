@@ -115,11 +115,16 @@ screens), `Support/` (shared models and styling).
   - **joystick tick at 0.25s** — converts the pad vector into a metric offset at `TravelMode.baseSpeed`
     with ±10% jitter.
 
-  Route following is a cancellable `Task` that interpolates between sampled coordinates and sleeps
-  by distance/speed. Every coordinate change funnels through the private `request(...)` → `enqueue` →
-  `drain`, a latest-wins coalescer with a single one-slot `pending` intent: the public API stays
-  synchronous and `Void` while the engine call is `async`, and a `.clear` always outranks a queued
-  `.apply`. `desired` is the intent (what the resend and joystick read); `simulated` is only written
+  Route following is a `Task` that interpolates between sampled coordinates and sleeps by
+  distance/speed. It checks `Task.isCancelled` **after** each sleep as well as before — `try?` around
+  `Task.sleep` swallows the cancellation, so without that second check a Stop still let one more step
+  run, and that step's apply could be drained after the clear completed and silently restart the
+  session. Every coordinate change funnels through the private `request(...)` → `enqueue` → `drain`,
+  a latest-wins coalescer with a single one-slot `pending` intent, so the public API stays synchronous
+  and `Void` while the engine call is `async`. A `.clear` outranks an `.apply` **only while the clear
+  is still sitting in `pending`** — once `drain` has taken it out and is awaiting the engine, a newly
+  enqueued `.apply` will be drained after it. Producers must therefore be stopped at the source
+  (`stop()` cancels `routeTask` and the joystick); do not rely on the coalescer to suppress them. `desired` is the intent (what the resend and joystick read); `simulated` is only written
   on a confirmed success and is what the UI renders. Background-task and notification side effects
   live in the drain.
 - **`TunnelConfig`** (`Engine/DeviceTunnel.swift`) resolves the tunnel IP (default `10.7.0.1`).

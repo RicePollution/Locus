@@ -18,6 +18,9 @@ struct MapHomeView: View {
     @State private var isRouting = false
     @State private var showRouteSheet = false
     @State private var showGPXImporter = false
+    /// Set when the planner is dismissed specifically to open the GPX picker, so the
+    /// picker is presented from the sheet's real onDismiss rather than after a guessed delay.
+    @State private var openImporterAfterPlannerDismiss = false
     @State private var drawnPath: [CLLocationCoordinate2D] = []
     @State private var drawMode = false
     @State private var pinSelected = false
@@ -130,14 +133,24 @@ struct MapHomeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .locusImportGPX)) { note in
             guard let url = note.object as? URL else { return }
-            importGPX(url)
+            // Arrives from the share sheet with no Locus UI open, so the planner can be
+            // shown immediately — nothing is mid-dismissal.
+            importGPX(url, reopenPlanner: true)
         }
         .fileImporter(isPresented: $showGPXImporter, allowedContentTypes: [.xml, .data], allowsMultipleSelection: false) { result in
             if case .success(let urls) = result, let url = urls.first {
-                importGPX(url)
+                // Do NOT re-present the planner here: this runs while the picker is still
+                // dismissing, so the presentation is silently dropped while the binding
+                // stays true, which would leave the planner permanently unreachable. The
+                // route drawn on the map is the confirmation; reopening it shows the status.
+                importGPX(url, reopenPlanner: false)
             }
         }
-        .sheet(isPresented: $showRouteSheet) {
+        .sheet(isPresented: $showRouteSheet, onDismiss: {
+            guard openImporterAfterPlannerDismiss else { return }
+            openImporterAfterPlannerDismiss = false
+            showGPXImporter = true
+        }) {
             RoutePlannerSheet(
                 start: $routeStart,
                 end: $routeEnd,
@@ -146,13 +159,12 @@ struct MapHomeView: View {
                 onBuild: buildRoadRoute,
                 onPlay: playRoute,
                 onImportGPX: {
-                    // The file importer is attached to this view, which is covered while
-                    // the planner sheet is up — presenting from a controller that is
-                    // already presenting silently does nothing. Dismiss first, then open.
+                    // The importer is attached to this view, which is covered while the
+                    // planner is up, and presenting from a controller that is already
+                    // presenting does nothing. Dismiss first and let onDismiss open the
+                    // picker, so this waits on the real signal instead of a fixed delay.
+                    openImporterAfterPlannerDismiss = true
                     showRouteSheet = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        showGPXImporter = true
-                    }
                 },
                 onExportGPX: exportGPX,
                 onUseDrawn: {
@@ -427,7 +439,7 @@ struct MapHomeView: View {
         session.followRoute(path, pairing: pairing)
     }
 
-    private func importGPX(_ url: URL) {
+    private func importGPX(_ url: URL, reopenPlanner: Bool) {
         do {
             let coords = try GPXCodec.parse(url)
             routeCoords = RouteBuilder.sample(coordinates: coords, every: 10)
@@ -436,9 +448,9 @@ struct MapHomeView: View {
                 session.pin = first
                 position = .region(MKCoordinateRegion(center: first, latitudinalMeters: 2000, longitudinalMeters: 2000))
             }
-            // A GPX can arrive from the share sheet with no Locus UI open, and importing
-            // from the planner dismissed it. Re-show it so the import is visible.
-            showRouteSheet = true
+            if reopenPlanner {
+                showRouteSheet = true
+            }
         } catch {
             session.lastError = error.localizedDescription
         }

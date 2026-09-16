@@ -23,7 +23,10 @@ enum LocationEngineError: LocalizedError {
         case .locationClear: return "Failed to clear simulated location."
         case .notActive: return "No active simulation session."
         case .portUnavailable:
-            return "No developer tunnel answered on \(TunnelConfig.targetIP). Tried port \(RemotePairingDiscovery.fallbackPort) and found no _remotepairing service. Is LocalDevVPN connected on Wi‑Fi?"
+            // Deliberately vague about which ports: up to three candidates are tried, and
+            // discovery may have found a port, found none, or found one already tried.
+            // Naming a single port here sent people debugging the wrong thing.
+            return "No developer tunnel answered on \(TunnelConfig.targetIP) on any port tried, including \(RemotePairingDiscovery.fallbackPort). Is LocalDevVPN connected on Wi‑Fi?"
         }
     }
 

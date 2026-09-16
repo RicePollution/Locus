@@ -226,6 +226,10 @@ final class SpoofSession: ObservableObject {
                     )
                     let delay = stepMeters / speed
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    // try? swallows the CancellationError, so re-check: without this the
+                    // step after a Stop still runs, and its apply can be drained after the
+                    // clear completes and quietly restart the whole session.
+                    if Task.isCancelled { break }
                     await MainActor.run {
                         self.request(coord, pairing: pairing, markRecent: false, source: .motion)
                     }
@@ -347,15 +351,19 @@ final class SpoofSession: ObservableObject {
             status = .connecting
         }
         isBusy = true
+        // Read the target once: the user can save a different tunnel IP in Settings while
+        // this is in flight, and the result belongs to the address we actually dialled.
+        let requestedIP = TunnelConfig.targetIP
         let result = await LocationEngine.set(
             latitude: coordinate.latitude,
             longitude: coordinate.longitude,
             pairingPath: pairing.pairingPath,
-            deviceIP: TunnelConfig.targetIP
+            deviceIP: requestedIP
         )
         isBusy = false
         // A stop arrived while this was in flight — let it own the status so Stop can't flash green.
         if case .clear = pending { return }
+
 
         switch result {
         case .success(let applied):
@@ -363,8 +371,8 @@ final class SpoofSession: ObservableObject {
             pin = coordinate
             activePort = applied.port
             lastTunnelPort = applied.port
-            confirmedTunnelIP = TunnelConfig.targetIP
-            provenTunnelIPs.insert(TunnelConfig.targetIP)
+            confirmedTunnelIP = requestedIP
+            provenTunnelIPs.insert(requestedIP)
             consecutiveFailures = 0
             dropNotified = false
             status = .active

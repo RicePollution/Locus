@@ -70,13 +70,22 @@ enum RouteBuilder {
         return sample(coordinates: coords, every: meters)
     }
 
+    /// Ceiling on interpolated points. A GPX with a huge jump between two consecutive
+    /// track points — a flight leg, a corrupt file — would otherwise interpolate millions
+    /// of coordinates on the main actor and hang or kill the app.
+    static let maxSampledPoints = 20_000
+    /// Most interpolated points allowed for a single pair, so one bad leg cannot consume
+    /// the whole budget and leave the rest of the track unsampled.
+    private static let maxStepsPerLeg = 2_000
+
     static func sample(coordinates: [CLLocationCoordinate2D], every meters: CLLocationDistance) -> [CLLocationCoordinate2D] {
         guard coordinates.count > 1 else { return coordinates }
         var sampled = [coordinates[0]]
         for (a, b) in zip(coordinates, coordinates.dropFirst()) {
+            if sampled.count >= maxSampledPoints { break }
             let dist = CLLocation(latitude: a.latitude, longitude: a.longitude)
                 .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude))
-            let steps = max(1, Int(ceil(dist / meters)))
+            let steps = min(maxStepsPerLeg, max(1, Int(ceil(dist / meters))))
             for i in 1...steps {
                 let t = Double(i) / Double(steps)
                 sampled.append(CLLocationCoordinate2D(
