@@ -12,6 +12,9 @@ struct MapHomeView: View {
     @State private var routeStart: CLLocationCoordinate2D?
     @State private var routeEnd: CLLocationCoordinate2D?
     @State private var routeCoords: [CLLocationCoordinate2D] = []
+    /// Set after a route is built, imported, or taken from a drawing, so the planner
+    /// can confirm a route actually exists. Nil means "no route loaded".
+    @State private var routeStatus: String?
     @State private var isRouting = false
     @State private var showRouteSheet = false
     @State private var showGPXImporter = false
@@ -136,12 +139,27 @@ struct MapHomeView: View {
                 start: $routeStart,
                 end: $routeEnd,
                 isRouting: $isRouting,
+                status: routeStatus,
                 onBuild: buildRoadRoute,
                 onPlay: playRoute,
-                onImportGPX: { showGPXImporter = true },
+                onImportGPX: {
+                    // The file importer is attached to this view, which is covered while
+                    // the planner sheet is up — presenting from a controller that is
+                    // already presenting silently does nothing. Dismiss first, then open.
+                    showRouteSheet = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        showGPXImporter = true
+                    }
+                },
                 onExportGPX: exportGPX,
                 onUseDrawn: {
-                    routeCoords = RouteBuilder.sample(coordinates: drawnPath, every: 10)
+                    let sampled = RouteBuilder.sample(coordinates: drawnPath, every: 10)
+                    guard !sampled.isEmpty else {
+                        session.lastError = "Draw a path on the map first."
+                        return
+                    }
+                    routeCoords = sampled
+                    routeStatus = "Using drawn path — \(sampled.count) points. Tap Follow route."
                     drawnPath.removeAll()
                     drawMode = false
                 }
@@ -363,14 +381,18 @@ struct MapHomeView: View {
         isRouting = true
         Task {
             do {
-                let coords = try await RouteBuilder.roadRoute(from: start, to: end, mode: session.travelMode)
+                let route = try await RouteBuilder.roadRoute(from: start, to: end, mode: session.travelMode)
                 await MainActor.run {
-                    routeCoords = coords
+                    routeCoords = route.coordinates
+                    routeStatus = route.fellBackToRoads
+                        ? "Route ready — \(route.coordinates.count) points, following roads (no footpath route available). Tap Follow route."
+                        : "Route ready — \(route.coordinates.count) points. Tap Follow route."
                     isRouting = false
                 }
             } catch {
                 await MainActor.run {
                     isRouting = false
+                    routeStatus = nil
                     session.lastError = error.localizedDescription
                 }
             }
@@ -391,10 +413,14 @@ struct MapHomeView: View {
         do {
             let coords = try GPXCodec.parse(url)
             routeCoords = RouteBuilder.sample(coordinates: coords, every: 10)
+            routeStatus = "Imported \(coords.count) GPX points (\(routeCoords.count) after sampling). Tap Follow route."
             if let first = coords.first {
                 session.pin = first
                 position = .region(MKCoordinateRegion(center: first, latitudinalMeters: 2000, longitudinalMeters: 2000))
             }
+            // A GPX can arrive from the share sheet with no Locus UI open, and importing
+            // from the planner dismissed it. Re-show it so the import is visible.
+            showRouteSheet = true
         } catch {
             session.lastError = error.localizedDescription
         }
@@ -413,7 +439,18 @@ struct MapHomeView: View {
             let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
             if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
                let root = scene.keyWindow?.rootViewController {
-                root.present(av, animated: true)
+                // The planner sheet is usually still up; presenting from the root while
+                // it is presenting does nothing, so walk to the topmost controller.
+                var top = root
+                while let presented = top.presentedViewController { top = presented }
+                // iPad is a supported device family, and a popover without a source
+                // anchor traps on presentation.
+                if let popover = av.popoverPresentationController {
+                    popover.sourceView = top.view
+                    popover.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.maxY, width: 0, height: 0)
+                    popover.permittedArrowDirections = []
+                }
+                top.present(av, animated: true)
             }
         } catch {
             session.lastError = error.localizedDescription

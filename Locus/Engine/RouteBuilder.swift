@@ -2,23 +2,65 @@ import CoreLocation
 import Foundation
 import MapKit
 
+/// Outcome of a road-route request.
+struct RoadRoute {
+    var coordinates: [CLLocationCoordinate2D]
+    /// True when footpath directions were unavailable and road directions were used
+    /// instead. Following still moves at the travel mode's own speed.
+    var fellBackToRoads: Bool
+}
+
+enum RouteError: LocalizedError {
+    case noRoute(TravelMode)
+
+    var errorDescription: String? {
+        switch self {
+        case .noRoute(let mode):
+            return "Apple Maps has no \(mode.title.lowercased()) route between those two points. "
+                + "They may be too far apart, or separated by water. Try an end point closer to "
+                + "the start, switch travel mode, or draw a path on the map instead."
+        }
+    }
+}
+
+/// Thrown by `directions` when MapKit answers with an empty route list.
+private struct NoRoutesFound: Error {}
+
 enum RouteBuilder {
     static func roadRoute(
         from start: CLLocationCoordinate2D,
         to end: CLLocationCoordinate2D,
         mode: TravelMode
+    ) async throws -> RoadRoute {
+        do {
+            let coords = try await directions(from: start, to: end, transportType: mode.mkTransportType)
+            return RoadRoute(coordinates: coords, fellBackToRoads: false)
+        } catch {
+            // MapKit refuses walking directions beyond a short distance, which is the
+            // usual cause of "directions not available" after teleporting somewhere far.
+            // Roads normally still connect the two points, so retry by car rather than
+            // failing outright; SpoofSession keeps using the chosen mode's speed.
+            guard mode.mkTransportType == .walking,
+                  let coords = try? await directions(from: start, to: end, transportType: .automobile) else {
+                throw RouteError.noRoute(mode)
+            }
+            return RoadRoute(coordinates: coords, fellBackToRoads: true)
+        }
+    }
+
+    private static func directions(
+        from start: CLLocationCoordinate2D,
+        to end: CLLocationCoordinate2D,
+        transportType: MKDirectionsTransportType
     ) async throws -> [CLLocationCoordinate2D] {
         let request = MKDirections.Request()
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
         request.destination = MKMapItem(placemark: MKPlacemark(coordinate: end))
-        request.transportType = mode.mkTransportType
+        request.transportType = transportType
         request.requestsAlternateRoutes = false
 
-        let directions = MKDirections(request: request)
-        let response = try await directions.calculate()
-        guard let route = response.routes.first else {
-            throw NSError(domain: "Locus", code: 1, userInfo: [NSLocalizedDescriptionKey: "No route found"])
-        }
+        let response = try await MKDirections(request: request).calculate()
+        guard let route = response.routes.first else { throw NoRoutesFound() }
         return sample(polyline: route.polyline, every: 12)
     }
 

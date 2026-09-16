@@ -5,6 +5,8 @@ struct RoutePlannerSheet: View {
     @Binding var start: CLLocationCoordinate2D?
     @Binding var end: CLLocationCoordinate2D?
     @Binding var isRouting: Bool
+    /// Confirmation of the currently loaded route; nil when none is loaded.
+    var status: String?
     var onBuild: () -> Void
     var onPlay: () -> Void
     var onImportGPX: () -> Void
@@ -17,6 +19,14 @@ struct RoutePlannerSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                if let status {
+                    Section {
+                        Label(status, systemImage: "checkmark.circle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(LocusTheme.statusGood)
+                    }
+                }
+
                 Section("Road route") {
                     Button("Use current pin / spoof as start") {
                         start = session.simulated ?? session.pin
