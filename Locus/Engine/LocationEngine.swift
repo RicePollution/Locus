@@ -224,8 +224,14 @@ enum LocationEngine {
             cleanup()
             return simulationCreate
         }
-        // location_simulation_new consumes/owns remote server lifecycle alongside handle
-        remoteServer = nil
+        // NOT consumed. The Rust side takes a mutable *borrow* of the remote server
+        // (ffi/src/dvt/location_simulation.rs does `&mut (*server).0` and never
+        // Box::from_raw's it); the simulation handle holds that reference with its
+        // lifetime transmuted to 'static. So the server has to outlive the simulation
+        // AND still be freed afterwards. cleanup() frees the simulation first and the
+        // server second, which is exactly that order. The original code nil'd the
+        // pointer here believing the call consumed it, which leaked one
+        // RemoteServerHandle for every tunnel build.
 
         if let setError = location_simulation_set(locationSimulation, latitude, longitude) {
             idevice_error_free(setError)
