@@ -17,6 +17,19 @@ struct MapHomeView: View {
     /// silently committing to one, and the fastest is only the default, not the verdict.
     @State private var routeCandidates: [RoadRoute] = []
     @State private var selectedRouteID: RoadRoute.ID?
+    /// Route-planner errors live here, not in `session.lastError`: that alert is bound on
+    /// RootView, behind this sheet, and a controller that is already presenting cannot
+    /// present again.
+    @State private var routeError: String?
+    /// Held so a build can be abandoned. Without this a slow build lands on top of a GPX
+    /// the user imported while it was in flight and silently replaces it.
+    @State private var routeBuildTask: Task<Void, Never>?
+    /// The endpoints the loaded route was built from, so a changed pin can be reported
+    /// instead of leaving confident mileage sitting under endpoints it never described.
+    @State private var routeBuiltFor: RouteEndpoints?
+    /// The pin last adopted as a destination, so a *newly dropped* pin becomes the
+    /// destination while an endpoint the user set deliberately survives.
+    @State private var lastAdoptedPin: CLLocationCoordinate2D?
     /// Set after a route is built, imported, or taken from a drawing, so the planner
     /// can confirm a route actually exists. Nil means "no route loaded".
     @State private var routeStatus: String?
@@ -168,6 +181,8 @@ struct MapHomeView: View {
                 end: $routeEnd,
                 isRouting: $isRouting,
                 status: routeStatus,
+                errorText: routeError,
+                isStale: routeIsStale,
                 resolvedStart: resolvedRouteStart,
                 candidates: routeCandidates,
                 selectedRouteID: selectedRouteID,
@@ -185,10 +200,12 @@ struct MapHomeView: View {
                 onExportGPX: exportGPX,
                 onUseDrawn: {
                     let sampled = RouteBuilder.sample(coordinates: drawnPath, every: 10)
-                    guard !sampled.isEmpty else {
-                        session.lastError = "Draw a path on the map first."
+                    guard sampled.count > 1 else {
+                        routeError = "Draw a path on the map first — tap the pencil, then tap along the route."
                         return
                     }
+                    cancelRouteBuild()
+                    routeError = nil
                     routeCoords = sampled
                     routeStatus = "Using drawn path — \(sampled.count) points. Tap Follow route."
                     clearRouteCandidates()
@@ -431,12 +448,41 @@ struct MapHomeView: View {
         routeStart ?? session.simulated ?? session.realCoordinate ?? session.pin
     }
 
-    /// Adopt the dropped pin as the destination when the user has not set one, so the
-    /// common path — drop a pin, open the planner, build — needs no setup at all.
+    /// Adopt the dropped pin as the destination, so the common path — drop a pin, open
+    /// the planner, build — needs no setup at all.
+    ///
+    /// Keyed on the pin having *moved*, not on the end being unset. Using nil-ness as the
+    /// proxy for "the user hasn't chosen" made this a one-shot: after the first build the
+    /// end was permanently non-nil, so dropping a new pin and tapping Build silently
+    /// rebuilt the route to the old destination, with nothing but a raw lat/lon in the
+    /// sheet to say so. Comparing against the last pin we adopted keeps a deliberately
+    /// swapped endpoint intact while still following a new pin.
     private func prepareRouteEndpoints() {
-        if routeEnd == nil, let pin = session.pin, !isSameSpot(pin, resolvedRouteStart) {
-            routeEnd = pin
-        }
+        guard let pin = session.pin else { return }
+        guard !isSameSpot(pin, lastAdoptedPin) else { return }
+        guard !isSameSpot(pin, resolvedRouteStart) else { return }
+        routeEnd = pin
+        lastAdoptedPin = pin
+    }
+
+    /// True when the loaded route no longer describes the endpoints shown beside it.
+    /// Changing an endpoint without rebuilding used to leave the alternates, the drawn
+    /// polyline and the ETA all describing the previous pair, which is worse than having
+    /// no route at all: the numbers are specific, confident, and about somewhere else.
+    private var routeIsStale: Bool {
+        guard let built = routeBuiltFor, let current = currentEndpoints else { return false }
+        return built != current
+    }
+
+    private var currentEndpoints: RouteEndpoints? {
+        guard let start = resolvedRouteStart, let end = routeEnd ?? session.pin else { return nil }
+        return RouteEndpoints(start: start, end: end)
+    }
+
+    private func cancelRouteBuild() {
+        routeBuildTask?.cancel()
+        routeBuildTask = nil
+        isRouting = false
     }
 
     private func isSameSpot(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D?) -> Bool {
@@ -447,43 +493,84 @@ struct MapHomeView: View {
     }
 
     private func buildRoadRoute() {
-        guard let start = resolvedRouteStart, let end = routeEnd ?? session.pin else {
-            session.lastError = "Set a route start and end."
+        // Name which endpoint is missing. "Set a route start and end" fired both when no
+        // destination was set and when no start was available at all — location denied,
+        // nothing simulated, no pin — telling the user to set endpoints with a pin they
+        // do not have.
+        guard let start = resolvedRouteStart else {
+            routeError = "No start position yet. Drop a pin and tap \"Set start to pin\", or "
+                + "allow location access so Locus knows where you are."
             return
         }
+        guard let end = routeEnd ?? session.pin else {
+            routeError = "No destination yet. Tap the map to drop a pin, then \"Set end to pin\"."
+            return
+        }
+        cancelRouteBuild()
+        routeError = nil
         isRouting = true
         let mode = session.travelMode
-        Task {
+        routeBuildTask = Task {
             do {
                 let routes = try await RouteBuilder.roadRoutes(from: start, to: end, mode: mode)
-                await MainActor.run {
-                    isRouting = false
-                    routeEnd = end
-                    routeCandidates = routes
-                    if let best = routes.first {
-                        select(route: best)
-                    }
+                if Task.isCancelled { return }
+                isRouting = false
+                // `guard` rather than `if let`: an empty result would otherwise leave the
+                // previous route drawn under a fresh, empty candidate list.
+                guard let best = routes.first else {
+                    failBuild(with: RouteError.noRoute(mode).localizedDescription)
+                    return
                 }
+                routeCandidates = routes
+                routeBuiltFor = RouteEndpoints(start: start, end: end)
+                select(route: best)
             } catch {
-                await MainActor.run {
-                    isRouting = false
-                    routeStatus = nil
-                    clearRouteCandidates()
-                    session.lastError = error.localizedDescription
-                }
+                if Task.isCancelled { return }
+                isRouting = false
+                failBuild(with: error.localizedDescription)
             }
         }
     }
 
+    /// Clear the *whole* route, not part of it. Clearing the status and the alternates
+    /// while leaving `routeCoords` drawn left a bold accent polyline on the map that
+    /// Follow route would happily play: build a route to A, then fail a build to B, and
+    /// the device drives to A while the user believes nothing was loaded.
+    private func failBuild(with message: String) {
+        routeError = message
+        routeStatus = nil
+        routeCoords = []
+        routeBuiltFor = nil
+        clearRouteCandidates()
+    }
+
     private func select(route: RoadRoute) {
+        // MapKit's distance and ETA come from MKRoute, not from the geometry, so they
+        // stay plausible when the geometry is empty — and an empty `routeCoords` makes
+        // playRoute fall through to the drawn path, following something the user never
+        // chose under a status line claiming a specific mileage.
+        guard route.coordinates.count > 1 else {
+            failBuild(with: "That route came back without a path to follow. Try rebuilding.")
+            return
+        }
         selectedRouteID = route.id
         routeCoords = route.coordinates
+        routeError = nil
         frame(coordinates: route.coordinates)
-        let summary = "\(RoutePlannerSheet.distanceText(route.distance)) · "
-            + "\(RoutePlannerSheet.durationText(route.expectedTravelTime))"
-        routeStatus = route.fellBackToRoads
-            ? "Route ready — \(summary), following roads (no footpath route available). Tap Follow route."
-            : "Route ready — \(summary). Tap Follow route."
+
+        var parts = [RouteFormat.summary(for: route)]
+        if let fallback = route.fallback {
+            parts.append(fallback.explanation)
+        }
+        if let spacing = route.simplifiedSpacing {
+            parts.append("long route, path simplified to about \(Int(spacing.rounded())) m "
+                         + "between points, so corners are approximate")
+        }
+        // Attributed rather than stated flatly: the ETA is Apple's estimate for a real
+        // car, while playback runs at the travel mode's own speed, and the two numbers
+        // are not the same. Claiming the first as ours would be a promise the follower
+        // does not keep.
+        routeStatus = "Route ready — \(parts.joined(separator: ", ")) (Maps estimate). Tap Follow route."
     }
 
     /// Put the whole route on screen once it is built. A route that starts off-camera
@@ -499,6 +586,11 @@ struct MapHomeView: View {
         // A straight north-south or east-west route has zero extent on one axis, and
         // insetting a zero side by a fraction of itself leaves it zero, so the camera
         // would try to frame a line with no width. Give it a floor in map points first.
+        // A route that crosses the antimeridian unions into a rect spanning nearly the
+        // whole world, and framing that shows the planet instead of the route. Leaving
+        // the camera where it is beats zooming out to nothing. Real on Taveuni, Fiji,
+        // where the 180th meridian crosses roads people drive.
+        guard rect.size.width < MKMapSize.world.width / 2 else { return }
         let minimumSide = max(rect.size.width, rect.size.height, 400) * 0.15
         position = .rect(rect.insetBy(dx: -minimumSide, dy: -minimumSide))
     }
@@ -513,7 +605,7 @@ struct MapHomeView: View {
     private func playRoute() {
         let path = routeCoords.isEmpty ? drawnPath : routeCoords
         guard path.count >= 2 else {
-            session.lastError = "Build or draw a route first."
+            routeError = "Build or draw a route first."
             return
         }
         showRouteSheet = false
@@ -523,6 +615,11 @@ struct MapHomeView: View {
     private func importGPX(_ url: URL, reopenPlanner: Bool) {
         do {
             let coords = try GPXCodec.parse(url)
+            // A build started before the picker opened would otherwise land on top of
+            // this and silently replace it.
+            cancelRouteBuild()
+            routeError = nil
+            routeBuiltFor = nil
             routeCoords = RouteBuilder.sample(coordinates: coords, every: 10)
             routeStatus = "Imported \(coords.count) GPX points (\(routeCoords.count) after sampling). Tap Follow route."
             clearRouteCandidates()
@@ -541,11 +638,13 @@ struct MapHomeView: View {
     private func exportGPX() {
         let path = routeCoords.isEmpty ? drawnPath : routeCoords
         guard !path.isEmpty else {
-            session.lastError = "Nothing to export."
+            routeError = "Nothing to export — build, draw, or import a route first."
             return
         }
         let gpx = GPXCodec.export(path)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("Locus-Route.gpx")
+        // The planner is up while this runs, so failures go to its own error row.
+
         do {
             try gpx.data(using: .utf8)?.write(to: url)
             let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
@@ -565,8 +664,25 @@ struct MapHomeView: View {
                 top.present(av, animated: true)
             }
         } catch {
-            session.lastError = error.localizedDescription
+            routeError = error.localizedDescription
         }
+    }
+}
+
+/// The endpoints a loaded route was built from. CLLocationCoordinate2D is not Equatable,
+/// and the comparison wants exact identity rather than a tolerance — this is asking "is
+/// this the same request", not "are these nearby".
+private struct RouteEndpoints: Equatable {
+    var startLatitude: Double
+    var startLongitude: Double
+    var endLatitude: Double
+    var endLongitude: Double
+
+    init(start: CLLocationCoordinate2D, end: CLLocationCoordinate2D) {
+        startLatitude = start.latitude
+        startLongitude = start.longitude
+        endLatitude = end.latitude
+        endLongitude = end.longitude
     }
 }
 

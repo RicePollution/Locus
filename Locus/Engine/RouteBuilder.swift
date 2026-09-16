@@ -15,16 +15,49 @@ struct RoadRoute: Identifiable {
     var coordinates: [CLLocationCoordinate2D]
     var distance: CLLocationDistance
     var expectedTravelTime: TimeInterval
-    /// True when footpath directions were unavailable and road directions were used
-    /// instead. Following still moves at the travel mode's own speed.
-    var fellBackToRoads: Bool
+    /// The spacing the geometry was actually sampled at, when that is coarser than the
+    /// ideal — nil when the route is carried at full fidelity. A long route is thinned
+    /// to fit the point budget, which is a fair trade against the alternative of losing
+    /// its tail, but the user picked a specific route out of a ranked list and the path
+    /// they will follow is no longer exactly the one they picked. Worth one line.
+    var simplifiedSpacing: CLLocationDistance?
+    /// Set when footpath directions were not used and road directions were followed
+    /// instead. Nil means the route is what was asked for.
+    var fallback: RouteFallback?
 
     /// Average speed Apple's routing engine implies for this route. It already accounts
     /// for limits, junctions, and — for automobile routes with a departure date —
     /// traffic, which makes it a good sanity bound on any speed we pick ourselves.
-    var averageSpeed: CLLocationSpeed {
-        guard expectedTravelTime > 0 else { return 0 }
+    ///
+    /// Optional rather than a zero sentinel: a speed of zero is not a slow route, it is
+    /// the absence of an answer, and anything that divided by the sentinel would get
+    /// infinity and then trap on the `Int(ceil(…))` conversion downstream.
+    var averageSpeed: CLLocationSpeed? {
+        guard expectedTravelTime > 0, distance > 0 else { return nil }
         return distance / expectedTravelTime
+    }
+}
+
+/// Why a walking request ended up following roads.
+///
+/// The distinction is the whole point of the type. One of these is a fact about the
+/// world and the other is a fact about the network, and the retry that produces them is
+/// deliberately *not* gated on which — so telling someone "no footpath route available"
+/// when the truth is "I couldn't reach Apple just then" asserts something the code never
+/// established, and leaves them with no reason to try again.
+enum RouteFallback {
+    /// MapKit answered, and said there is no walking route between these two points.
+    case noWalkingRoute
+    /// The walking request never got an answer — offline, throttled, or timed out.
+    case walkingLookupUnverified
+
+    var explanation: String {
+        switch self {
+        case .noWalkingRoute:
+            return "following roads (no footpath route available)"
+        case .walkingLookupUnverified:
+            return "following roads (couldn't check footpaths just now — rebuild to retry)"
+        }
     }
 }
 
@@ -59,6 +92,9 @@ enum RouteBuilder {
     /// told what actually happened.
     static let minimumRouteDistance: CLLocationDistance = 15
 
+    /// Spacing a route is densified at when it comfortably fits the point budget.
+    static let idealSpacing: CLLocationDistance = 12
+
     /// Every route MapKit is willing to offer for these endpoints, quickest first.
     ///
     /// Asking for alternates and sorting them ourselves is the whole point: MapKit puts
@@ -80,7 +116,7 @@ enum RouteBuilder {
             return try await directions(
                 from: start, to: end,
                 transportType: mode.mkTransportType,
-                fellBackToRoads: false
+                fallback: nil
             )
         } catch {
             primaryError = error
@@ -95,10 +131,15 @@ enum RouteBuilder {
             throw routeError(for: mode, attempts: [primaryError])
         }
         do {
+            // Classify the walking failure for the *message* only. The retry above ran
+            // regardless, which is the correct behaviour; this just stops the result
+            // claiming footpaths were checked when they were not.
             return try await directions(
                 from: start, to: end,
                 transportType: .automobile,
-                fellBackToRoads: true
+                fallback: routeGenuinelyUnavailable(primaryError)
+                    ? .noWalkingRoute
+                    : .walkingLookupUnverified
             )
         } catch {
             throw routeError(for: mode, attempts: [primaryError, error])
@@ -133,7 +174,7 @@ enum RouteBuilder {
         from start: CLLocationCoordinate2D,
         to end: CLLocationCoordinate2D,
         transportType: MKDirectionsTransportType,
-        fellBackToRoads: Bool
+        fallback: RouteFallback?
     ) async throws -> [RoadRoute] {
         let request = MKDirections.Request()
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
@@ -142,8 +183,12 @@ enum RouteBuilder {
         request.requestsAlternateRoutes = true
         // Automobile ETAs are traffic-aware only when a departure date is supplied, and
         // the ETA is what the routes are ranked by — without this they are all quoted at
-        // free-flow speed and the ranking is the wrong one at rush hour.
-        request.departureDate = Date()
+        // free-flow speed and the ranking is the wrong one at rush hour. Scoped to the
+        // transport type the justification actually covers: walking ETAs do not vary
+        // with traffic, and upstream sent no departure date at all.
+        if transportType == .automobile {
+            request.departureDate = Date()
+        }
 
         let response = try await MKDirections(request: request).calculate()
         guard !response.routes.isEmpty else { throw NoRoutesFound() }
@@ -152,20 +197,32 @@ enum RouteBuilder {
             // stable, and two equal-time alternates reshuffling between builds would
             // silently swap which route the planner has highlighted.
             .sorted {
-                ($0.expectedTravelTime, $0.distance) < ($1.expectedTravelTime, $1.distance)
+                // A non-positive ETA is a missing answer, not a zero-second journey, so
+                // it must not sort to the head and get labelled "Fastest" — it would be
+                // auto-selected and rendered as "< 1 min" for a 12-mile drive.
+                (Self.rank($0.expectedTravelTime), $0.distance)
+                    < (Self.rank($1.expectedTravelTime), $1.distance)
             }
             .map { route in
-                RoadRoute(
+                let step = spacing(forRouteLength: route.distance)
+                // Thinning is the more destructive half: past the source cap, dropped
+                // vertices cut across tight interchange loops rather than merely
+                // smoothing them.
+                let wasThinned = route.polyline.pointCount > maxSourcePoints
+                return RoadRoute(
                     name: route.name,
-                    coordinates: sample(
-                        polyline: route.polyline,
-                        every: spacing(forRouteLength: route.distance)
-                    ),
+                    coordinates: sample(polyline: route.polyline, every: step),
                     distance: route.distance,
                     expectedTravelTime: route.expectedTravelTime,
-                    fellBackToRoads: fellBackToRoads
+                    simplifiedSpacing: (step > idealSpacing || wasThinned) ? step : nil,
+                    fallback: fallback
                 )
             }
+    }
+
+    /// Sort key that pushes unusable ETAs to the back instead of the front.
+    private static func rank(_ travelTime: TimeInterval) -> TimeInterval {
+        travelTime > 0 && travelTime.isFinite ? travelTime : .greatestFiniteMagnitude
     }
 
     /// Spacing to densify a route of this length at, in meters.
@@ -178,14 +235,19 @@ enum RouteBuilder {
     /// route that actually reaches its destination.
     static func spacing(
         forRouteLength meters: CLLocationDistance,
-        ideal: CLLocationDistance = 12
+        ideal: CLLocationDistance = idealSpacing
     ) -> CLLocationDistance {
         guard meters.isFinite, meters > 0 else { return ideal }
         // Only part of the ceiling is spent on interpolation: every leg costs at least
         // one point whatever the spacing, and `maxSourcePoints` of those are already
         // committed before a single point is interpolated. The two together have to stay
         // under `maxSampledPoints`, or the hard break amputates the tail again.
-        let budget = Double(maxSampledPoints - maxSourcePoints) * 0.95
+        // Clamped: if `maxSourcePoints` were ever raised to meet or exceed
+        // `maxSampledPoints`, an unclamped budget would go zero or negative, `max(ideal,
+        // …)` would collapse back to `ideal`, and the break in `sample` would start
+        // amputating tails again — the exact bug this whole path exists to prevent, back
+        // with the same absence of any signal. The two constants are bound together.
+        let budget = Double(max(1, maxSampledPoints - maxSourcePoints)) * 0.95
         return max(ideal, meters / budget)
     }
 
@@ -232,20 +294,22 @@ enum RouteBuilder {
         return sampled
     }
 
-    /// Keep at most `limit` points, evenly spread, and always the last one. Dropping
-    /// every nth point preserves the track's full extent; the old ceiling stopped copying
-    /// partway instead, which amputated the end of it.
+    /// Keep exactly `limit` points, evenly spread, including both endpoints. Thinning
+    /// preserves the track's full extent; the old ceiling stopped copying partway
+    /// instead, which amputated the end of it.
+    ///
+    /// The output index is mapped back onto the input rather than walking an integer
+    /// stride. A stride of 2 over 5,001 points keeps 2,501 of the 5,000 allowed and
+    /// throws away half the permitted fidelity for one point of overshoot, with the same
+    /// cliff at every multiple of the limit.
     private static func thinned(_ coordinates: [CLLocationCoordinate2D], to limit: Int) -> [CLLocationCoordinate2D] {
         guard limit > 1, coordinates.count > limit else { return coordinates }
-        let stride = Int(ceil(Double(coordinates.count) / Double(limit)))
+        let lastIndex = coordinates.count - 1
         var kept: [CLLocationCoordinate2D] = []
-        kept.reserveCapacity(limit + 1)
-        for (index, coordinate) in coordinates.enumerated() where index % stride == 0 {
-            kept.append(coordinate)
-        }
-        if let last = coordinates.last, let keptLast = kept.last,
-           keptLast.latitude != last.latitude || keptLast.longitude != last.longitude {
-            kept.append(last)
+        kept.reserveCapacity(limit)
+        for i in 0..<limit {
+            let position = Double(i) * Double(lastIndex) / Double(limit - 1)
+            kept.append(coordinates[min(Int(position.rounded()), lastIndex)])
         }
         return kept
     }
@@ -255,6 +319,49 @@ enum RouteBuilder {
             total + CLLocation(latitude: pair.0.latitude, longitude: pair.0.longitude)
                 .distance(from: CLLocation(latitude: pair.1.latitude, longitude: pair.1.longitude))
         }
+    }
+}
+
+/// Locale-correct rendering of the numbers a route quotes. Lives beside the route
+/// rather than on the planner sheet: the map's status line needs the same strings, and
+/// a View type is the wrong place for a map layer to reach into.
+enum RouteFormat {
+    /// MKDistanceFormatter follows the device's measurement system, so a US user reads
+    /// miles and everyone else reads kilometres without us deciding for them.
+    private static let distanceFormatter: MKDistanceFormatter = {
+        let f = MKDistanceFormatter()
+        f.unitStyle = .abbreviated
+        return f
+    }()
+
+    private static let durationFormatter: DateComponentsFormatter = {
+        let f = DateComponentsFormatter()
+        f.allowedUnits = [.hour, .minute]
+        f.unitsStyle = .abbreviated
+        f.maximumUnitCount = 2
+        return f
+    }()
+
+    /// "12 km · 15 min", or just the distance when MapKit quoted no usable ETA.
+    static func summary(for route: RoadRoute) -> String {
+        guard let duration = duration(route.expectedTravelTime) else {
+            return "\(distance(route.distance)) · no ETA"
+        }
+        return "\(distance(route.distance)) · \(duration)"
+    }
+
+    static func distance(_ meters: CLLocationDistance) -> String {
+        distanceFormatter.string(fromDistance: meters)
+    }
+
+    /// Nil when MapKit gave no usable estimate, so callers render the absence rather
+    /// than printing a confident "< 1 min" for a journey of unknown length.
+    static func duration(_ seconds: TimeInterval) -> String? {
+        guard seconds > 0, seconds.isFinite else { return nil }
+        // Anything under a minute formats as an empty string with .hour/.minute units,
+        // which would render as a bare separator dot.
+        guard seconds >= 60 else { return "< 1 min" }
+        return durationFormatter.string(from: seconds)
     }
 }
 

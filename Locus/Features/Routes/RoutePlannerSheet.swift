@@ -8,6 +8,14 @@ struct RoutePlannerSheet: View {
     @Binding var isRouting: Bool
     /// Confirmation of the currently loaded route; nil when none is loaded.
     var status: String?
+    /// Anything that went wrong while the planner was open. It is shown here rather than
+    /// through `session.lastError`, whose alert is bound on `RootView` — behind this
+    /// sheet. A controller that is already presenting cannot present again, so those
+    /// messages either vanish or surface later with no context, which is the one thing a
+    /// route error must not do: the user is standing on the button that just failed.
+    var errorText: String?
+    /// True when an endpoint has changed since the loaded route was built.
+    var isStale: Bool
     /// What the route will actually start from, including the implicit "wherever you are"
     /// when `start` is nil. Shown rather than silently used, since a route from the wrong
     /// place is the failure that is hardest to spot on a map.
@@ -29,6 +37,23 @@ struct RoutePlannerSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                if let errorText {
+                    Section {
+                        Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(LocusTheme.statusBad)
+                    }
+                }
+
+                if isStale {
+                    Section {
+                        Label("Start or end changed since this route was built — rebuild to "
+                              + "update it.", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.footnote)
+                            .foregroundStyle(LocusTheme.statusWarn)
+                    }
+                }
+
                 if let status {
                     Section {
                         Label(status, systemImage: "checkmark.circle.fill")
@@ -140,7 +165,7 @@ struct RoutePlannerSheet: View {
                             .background(Capsule().fill(LocusTheme.accent.opacity(0.22)))
                     }
                 }
-                Text("\(Self.distanceText(route.distance)) · \(Self.durationText(route.expectedTravelTime))")
+                Text(RouteFormat.summary(for: route))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -156,30 +181,4 @@ struct RoutePlannerSheet: View {
         return String(format: "%.5f, %.5f", c.latitude, c.longitude)
     }
 
-    /// MKDistanceFormatter follows the device's measurement system, so a US user reads
-    /// miles and everyone else reads kilometres without us deciding for them.
-    private static let distanceFormatter: MKDistanceFormatter = {
-        let f = MKDistanceFormatter()
-        f.unitStyle = .abbreviated
-        return f
-    }()
-
-    private static let durationFormatter: DateComponentsFormatter = {
-        let f = DateComponentsFormatter()
-        f.allowedUnits = [.hour, .minute]
-        f.unitsStyle = .abbreviated
-        f.maximumUnitCount = 2
-        return f
-    }()
-
-    static func distanceText(_ meters: CLLocationDistance) -> String {
-        distanceFormatter.string(fromDistance: meters)
-    }
-
-    static func durationText(_ seconds: TimeInterval) -> String {
-        // Anything under a minute formats as an empty string with .hour/.minute units,
-        // which would render as a bare separator dot.
-        guard seconds >= 60 else { return "< 1 min" }
-        return durationFormatter.string(from: seconds) ?? "—"
-    }
 }

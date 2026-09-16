@@ -221,8 +221,12 @@ final class SpoofSession: ObservableObject {
                 // than stepMeters still costs exactly one step, and charging it the full
                 // stepMeters / speed made it wait for a distance it never travelled — a
                 // hand-drawn path, whose legs are mostly a metre or two, crawled at a
-                // small fraction of the mode's speed. The floor only guards against a
-                // duplicate track point spinning the loop with no delay at all.
+                // small fraction of the mode's speed. The floor guards against a
+                // duplicate track point — every GPS recorder emits them while the device
+                // sits still — spinning the loop with no delay at all. It is also a 20 Hz
+                // cap: a leg under ~0.7 m at drive speed plays slightly slow. Road routes
+                // never reach it (their steps are 4–12 m), and the engine cannot apply
+                // fixes that fast anyway.
                 let delay = max(0.05, (distance / Double(steps)) / speed)
                 for i in 1...steps {
                     if Task.isCancelled { break }
