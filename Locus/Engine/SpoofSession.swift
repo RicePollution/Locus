@@ -217,6 +217,13 @@ final class SpoofSession: ObservableObject {
                 speed = max(0.8, speed)
                 let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
                 let steps = max(1, Int(ceil(distance / stepMeters)))
+                // Pace off the step actually taken, not the nominal one. A leg shorter
+                // than stepMeters still costs exactly one step, and charging it the full
+                // stepMeters / speed made it wait for a distance it never travelled — a
+                // hand-drawn path, whose legs are mostly a metre or two, crawled at a
+                // small fraction of the mode's speed. The floor only guards against a
+                // duplicate track point spinning the loop with no delay at all.
+                let delay = max(0.05, (distance / Double(steps)) / speed)
                 for i in 1...steps {
                     if Task.isCancelled { break }
                     let t = Double(i) / Double(steps)
@@ -224,7 +231,6 @@ final class SpoofSession: ObservableObject {
                         latitude: previous.latitude + (next.latitude - previous.latitude) * t,
                         longitude: previous.longitude + (next.longitude - previous.longitude) * t
                     )
-                    let delay = stepMeters / speed
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     // try? swallows the CancellationError, so re-check: without this the
                     // step after a Stop still runs, and its apply can be drained after the

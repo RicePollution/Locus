@@ -12,6 +12,11 @@ struct MapHomeView: View {
     @State private var routeStart: CLLocationCoordinate2D?
     @State private var routeEnd: CLLocationCoordinate2D?
     @State private var routeCoords: [CLLocationCoordinate2D] = []
+    /// Every route MapKit offered for the last build, quickest first, plus which one the
+    /// user picked. Apple Maps and Google Maps both show the alternates rather than
+    /// silently committing to one, and the fastest is only the default, not the verdict.
+    @State private var routeCandidates: [RoadRoute] = []
+    @State private var selectedRouteID: RoadRoute.ID?
     /// Set after a route is built, imported, or taken from a drawing, so the planner
     /// can confirm a route actually exists. Nil means "no route loaded".
     @State private var routeStatus: String?
@@ -99,6 +104,13 @@ struct MapHomeView: View {
                             }
                         }
                     }
+                    // Alternates sit behind the chosen route, greyed, the way Maps
+                    // shows the ones you didn't pick — tapping one in the planner
+                    // promotes it.
+                    ForEach(routeCandidates.filter { $0.id != selectedRouteID }) { alternate in
+                        MapPolyline(coordinates: alternate.coordinates)
+                            .stroke(Color.secondary.opacity(0.45), lineWidth: 3)
+                    }
                     if routeCoords.count > 1 {
                         MapPolyline(coordinates: routeCoords)
                             .stroke(LocusTheme.accent, lineWidth: 5)
@@ -156,7 +168,11 @@ struct MapHomeView: View {
                 end: $routeEnd,
                 isRouting: $isRouting,
                 status: routeStatus,
+                resolvedStart: resolvedRouteStart,
+                candidates: routeCandidates,
+                selectedRouteID: selectedRouteID,
                 onBuild: buildRoadRoute,
+                onSelectRoute: select(route:),
                 onPlay: playRoute,
                 onImportGPX: {
                     // The importer is attached to this view, which is covered while the
@@ -175,6 +191,7 @@ struct MapHomeView: View {
                     }
                     routeCoords = sampled
                     routeStatus = "Using drawn path — \(sampled.count) points. Tap Follow route."
+                    clearRouteCandidates()
                     drawnPath.removeAll()
                     drawMode = false
                 }
@@ -301,6 +318,7 @@ struct MapHomeView: View {
                 session.mapStyleIndex = (session.mapStyleIndex + 1) % 3
             }
             chromeIconButton("point.topleft.down.to.point.bottomright.curvepath") {
+                prepareRouteEndpoints()
                 showRouteSheet = true
             }
             chromeIconButton(drawMode ? "pencil.tip.crop.circle.badge.minus" : "pencil.tip.crop.circle") {
@@ -402,31 +420,94 @@ struct MapHomeView: View {
         }
     }
 
+    /// Where a route starts when the user has not named a start: wherever they are.
+    ///
+    /// Deliberately computed on every read rather than stored, so it follows a teleport.
+    /// The pin is the last resort and not the first: it is also where "Set end to pin"
+    /// puts the end, so preferring it asked MapKit to route a point to itself, and MapKit
+    /// answers that with a flat "directions not available" that reads as "your
+    /// destination is unreachable".
+    private var resolvedRouteStart: CLLocationCoordinate2D? {
+        routeStart ?? session.simulated ?? session.realCoordinate ?? session.pin
+    }
+
+    /// Adopt the dropped pin as the destination when the user has not set one, so the
+    /// common path — drop a pin, open the planner, build — needs no setup at all.
+    private func prepareRouteEndpoints() {
+        if routeEnd == nil, let pin = session.pin, !isSameSpot(pin, resolvedRouteStart) {
+            routeEnd = pin
+        }
+    }
+
+    private func isSameSpot(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D?) -> Bool {
+        guard let b else { return false }
+        return CLLocation(latitude: a.latitude, longitude: a.longitude)
+            .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude))
+            < RouteBuilder.minimumRouteDistance
+    }
+
     private func buildRoadRoute() {
-        guard let start = routeStart ?? session.simulated ?? session.pin,
-              let end = routeEnd else {
+        guard let start = resolvedRouteStart, let end = routeEnd ?? session.pin else {
             session.lastError = "Set a route start and end."
             return
         }
         isRouting = true
+        let mode = session.travelMode
         Task {
             do {
-                let route = try await RouteBuilder.roadRoute(from: start, to: end, mode: session.travelMode)
+                let routes = try await RouteBuilder.roadRoutes(from: start, to: end, mode: mode)
                 await MainActor.run {
-                    routeCoords = route.coordinates
-                    routeStatus = route.fellBackToRoads
-                        ? "Route ready — \(route.coordinates.count) points, following roads (no footpath route available). Tap Follow route."
-                        : "Route ready — \(route.coordinates.count) points. Tap Follow route."
                     isRouting = false
+                    routeEnd = end
+                    routeCandidates = routes
+                    if let best = routes.first {
+                        select(route: best)
+                    }
                 }
             } catch {
                 await MainActor.run {
                     isRouting = false
                     routeStatus = nil
+                    clearRouteCandidates()
                     session.lastError = error.localizedDescription
                 }
             }
         }
+    }
+
+    private func select(route: RoadRoute) {
+        selectedRouteID = route.id
+        routeCoords = route.coordinates
+        frame(coordinates: route.coordinates)
+        let summary = "\(RoutePlannerSheet.distanceText(route.distance)) · "
+            + "\(RoutePlannerSheet.durationText(route.expectedTravelTime))"
+        routeStatus = route.fellBackToRoads
+            ? "Route ready — \(summary), following roads (no footpath route available). Tap Follow route."
+            : "Route ready — \(summary). Tap Follow route."
+    }
+
+    /// Put the whole route on screen once it is built. A route that starts off-camera
+    /// looks like nothing happened, which is most of them: the end pin is usually the
+    /// only part of it the user has actually looked at.
+    private func frame(coordinates: [CLLocationCoordinate2D]) {
+        guard let first = coordinates.first else { return }
+        var rect = MKMapRect(origin: MKMapPoint(first), size: MKMapSize(width: 0, height: 0))
+        for coordinate in coordinates.dropFirst() {
+            let point = MKMapPoint(coordinate)
+            rect = rect.union(MKMapRect(origin: point, size: MKMapSize(width: 0, height: 0)))
+        }
+        // A straight north-south or east-west route has zero extent on one axis, and
+        // insetting a zero side by a fraction of itself leaves it zero, so the camera
+        // would try to frame a line with no width. Give it a floor in map points first.
+        let minimumSide = max(rect.size.width, rect.size.height, 400) * 0.15
+        position = .rect(rect.insetBy(dx: -minimumSide, dy: -minimumSide))
+    }
+
+    /// A route from GPX, a drawing, or a failed build has no MapKit alternates behind it;
+    /// leaving the old ones listed would offer a choice that no longer draws anything.
+    private func clearRouteCandidates() {
+        routeCandidates = []
+        selectedRouteID = nil
     }
 
     private func playRoute() {
@@ -444,6 +525,7 @@ struct MapHomeView: View {
             let coords = try GPXCodec.parse(url)
             routeCoords = RouteBuilder.sample(coordinates: coords, every: 10)
             routeStatus = "Imported \(coords.count) GPX points (\(routeCoords.count) after sampling). Tap Follow route."
+            clearRouteCandidates()
             if let first = coords.first {
                 session.pin = first
                 position = .region(MKCoordinateRegion(center: first, latitudinalMeters: 2000, longitudinalMeters: 2000))
