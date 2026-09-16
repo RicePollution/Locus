@@ -108,6 +108,10 @@ struct MapHomeView: View {
                 .mapStyle(mapStyle)
                 .mapControlVisibility(.hidden)
                 .onTapGesture { point in
+                    NSLog("[LocusTap] FIRED at %@  drawMode=%@ isDraggingPin=%@ suppressed=%@",
+                          String(describing: point), String(describing: drawMode),
+                          String(describing: isDraggingPin),
+                          String(describing: Date() < suppressTapsUntil))
                     searchFocused = false
                     // A cancelled drag can leave isDraggingPin set with no onDragEnded to
                     // clear it. Once the suppression window has lapsed the drag is over
@@ -115,7 +119,10 @@ struct MapHomeView: View {
                     if isDraggingPin, Date() >= suppressTapsUntil {
                         isDraggingPin = false
                     }
-                    guard Date() >= suppressTapsUntil, !isDraggingPin else { return }
+                    guard Date() >= suppressTapsUntil, !isDraggingPin else {
+                        NSLog("[LocusTap] SWALLOWED by guard")
+                        return
+                    }
                     pinSelected = false
                     placePin(at: point, proxy: proxy)
                 }
@@ -174,13 +181,20 @@ struct MapHomeView: View {
     }
 
     private func placePin(at point: CGPoint, proxy: MapProxy) {
-        guard let coord = proxy.convert(point, from: .local) else { return }
+        guard let coord = proxy.convert(point, from: .local) else {
+            NSLog("[LocusTap] proxy.convert RETURNED NIL for %@", String(describing: point))
+            return
+        }
+        NSLog("[LocusTap] converted to %f,%f  drawMode=%@", coord.latitude, coord.longitude,
+              String(describing: drawMode))
         if drawMode {
             drawnPath.append(coord)
+            NSLog("[LocusTap] appended to drawnPath, count=%d", drawnPath.count)
         } else {
             session.pin = coord
             pinPlaceName = nil
             pinSelected = false
+            NSLog("[LocusTap] session.pin SET -> %@", String(describing: session.pin))
         }
     }
 
