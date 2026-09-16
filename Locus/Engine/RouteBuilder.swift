@@ -21,6 +21,11 @@ struct RoadRoute: Identifiable {
     /// its tail, but the user picked a specific route out of a ranked list and the path
     /// they will follow is no longer exactly the one they picked. Worth one line.
     var simplifiedSpacing: CLLocationDistance?
+    /// True when source vertices were actually discarded to fit the budget, as opposed to
+    /// merely interpolated more coarsely. Only this one means the *shape* changed:
+    /// widening the step drops no vertex, because every leg's final interpolated point
+    /// lands exactly on the source point.
+    var droppedVertices: Bool
     /// Set when footpath directions were not used and road directions were followed
     /// instead. Nil means the route is what was asked for.
     var fallback: RouteFallback?
@@ -215,6 +220,7 @@ enum RouteBuilder {
                     distance: route.distance,
                     expectedTravelTime: route.expectedTravelTime,
                     simplifiedSpacing: (step > idealSpacing || wasThinned) ? step : nil,
+                    droppedVertices: wasThinned,
                     fallback: fallback
                 )
             }

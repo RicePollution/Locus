@@ -1,5 +1,4 @@
 import CoreLocation
-import MapKit
 import SwiftUI
 
 struct RoutePlannerSheet: View {
@@ -108,7 +107,13 @@ struct RoutePlannerSheet: View {
                             Button {
                                 onSelectRoute(route)
                             } label: {
-                                routeRow(route, isFastest: index == 0)
+                                // Only claim "Fastest" when there is a time to be fastest by
+                            // and something to be faster than.
+                            routeRow(
+                                route,
+                                isFastest: index == 0 && candidates.count > 1
+                                    && RouteFormat.duration(route.expectedTravelTime) != nil
+                            )
                             }
                             .buttonStyle(.plain)
                         }

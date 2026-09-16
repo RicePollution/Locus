@@ -206,6 +206,9 @@ struct MapHomeView: View {
                     }
                     cancelRouteBuild()
                     routeError = nil
+                    // A drawing was never built from endpoints, so the staleness warning
+                    // has nothing to compare against and would fire on the next new pin.
+                    routeBuiltFor = nil
                     routeCoords = sampled
                     routeStatus = "Using drawn path — \(sampled.count) points. Tap Follow route."
                     clearRouteCandidates()
@@ -335,6 +338,7 @@ struct MapHomeView: View {
                 session.mapStyleIndex = (session.mapStyleIndex + 1) % 3
             }
             chromeIconButton("point.topleft.down.to.point.bottomright.curvepath") {
+                routeError = nil
                 prepareRouteEndpoints()
                 showRouteSheet = true
             }
@@ -469,18 +473,21 @@ struct MapHomeView: View {
     /// Changing an endpoint without rebuilding used to leave the alternates, the drawn
     /// polyline and the ETA all describing the previous pair, which is worse than having
     /// no route at all: the numbers are specific, confident, and about somewhere else.
-    /// Deliberately blind to the *resolved* start. That one floats on `session.simulated`,
-    /// which moves continuously while a route is being followed — keying staleness to it
-    /// would light the warning up permanently the moment playback starts, for a route
-    /// that is doing exactly what was asked. Staleness means the user changed their mind,
-    /// not that they moved.
+    /// Suppressed *while following*, not always. The resolved start floats on
+    /// `session.simulated`, which playback moves continuously, so keying staleness to it
+    /// unconditionally would light the warning up for a route doing exactly what was
+    /// asked. But suppressing it outright hid the case that actually matters: teleport
+    /// somewhere after building, and the planner would show Start and End as the same
+    /// coordinate under a status line still quoting the old route's mileage — and Follow
+    /// route would teleport back to the original start and drive from there.
     private var routeIsStale: Bool {
         guard let built = routeBuiltFor else { return false }
         if let end = routeEnd ?? session.pin,
            end.latitude != built.endLatitude || end.longitude != built.endLongitude {
             return true
         }
-        if let start = routeStart,
+        guard !session.isFollowingRoute else { return false }
+        if let start = resolvedRouteStart,
            start.latitude != built.startLatitude || start.longitude != built.startLongitude {
             return true
         }
@@ -531,7 +538,11 @@ struct MapHomeView: View {
                 }
                 routeCandidates = routes
                 routeBuiltFor = RouteEndpoints(start: start, end: end)
-                select(route: best)
+                guard load(route: best) else {
+                    failBuild(with: "That route came back without a path to follow. Try rebuilding.")
+                    return
+                }
+                routeBuildTask = nil
             } catch {
                 if Task.isCancelled { return }
                 isRouting = false
@@ -552,15 +563,25 @@ struct MapHomeView: View {
         clearRouteCandidates()
     }
 
+    /// Selecting an alternate from the list must not be able to destroy a good loaded
+    /// route. Tapping a sibling that came back without geometry used to unwind the whole
+    /// build — the drawn route, the status and all three candidates — so you lost a
+    /// working route by looking at a broken one.
     private func select(route: RoadRoute) {
+        guard load(route: route) else {
+            routeError = "That alternate came back without a path to follow — keeping the current route."
+            return
+        }
+    }
+
+    /// Install a candidate as the active route. Returns false, touching nothing, when the
+    /// candidate has no usable geometry, so each caller decides what that means.
+    private func load(route: RoadRoute) -> Bool {
         // MapKit's distance and ETA come from MKRoute, not from the geometry, so they
         // stay plausible when the geometry is empty — and an empty `routeCoords` makes
         // playRoute fall through to the drawn path, following something the user never
         // chose under a status line claiming a specific mileage.
-        guard route.coordinates.count > 1 else {
-            failBuild(with: "That route came back without a path to follow. Try rebuilding.")
-            return
-        }
+        guard route.coordinates.count > 1 else { return false }
         selectedRouteID = route.id
         routeCoords = route.coordinates
         routeError = nil
@@ -570,15 +591,21 @@ struct MapHomeView: View {
         if let fallback = route.fallback {
             parts.append(fallback.explanation)
         }
-        if let spacing = route.simplifiedSpacing {
-            parts.append("long route, path simplified to about \(Int(spacing.rounded())) m "
-                         + "between points, so corners are approximate")
+        if route.droppedVertices {
+            parts.append("long route, shape simplified so corners are approximate")
+        } else if let spacing = route.simplifiedSpacing {
+            // Wider spacing alone drops no MKRoute vertex — every leg's last interpolated
+            // point lands exactly on the source point — so the shape is intact and only
+            // the playback granularity is coarser. Claiming approximate corners here
+            // would be an over-warning.
+            parts.append("long route, \(Int(spacing.rounded())) m between playback points")
         }
         // Attributed rather than stated flatly: the ETA is Apple's estimate for a real
         // car, while playback runs at the travel mode's own speed, and the two numbers
         // are not the same. Claiming the first as ours would be a promise the follower
         // does not keep.
         routeStatus = "Route ready — \(parts.joined(separator: ", ")) (Maps estimate). Tap Follow route."
+        return true
     }
 
     /// Put the whole route on screen once it is built. A route that starts off-camera
@@ -616,6 +643,9 @@ struct MapHomeView: View {
             routeError = "Build or draw a route first."
             return
         }
+        // A build still in flight would land after this and replace the route under the
+        // one now being followed, yanking the camera to a path the user is not on.
+        cancelRouteBuild()
         showRouteSheet = false
         session.followRoute(path, pairing: pairing)
     }
@@ -633,13 +663,28 @@ struct MapHomeView: View {
             clearRouteCandidates()
             if let first = coords.first {
                 session.pin = first
+                // Recorded as adopted, or the next planner open takes the imported
+                // track's own start as the destination.
+                lastAdoptedPin = first
                 position = .region(MKCoordinateRegion(center: first, latitudinalMeters: 2000, longitudinalMeters: 2000))
             }
             if reopenPlanner {
                 showRouteSheet = true
             }
         } catch {
-            session.lastError = error.localizedDescription
+            report(error.localizedDescription)
+        }
+    }
+
+    /// Route problems go to the planner when it is open and to the app-wide alert when it
+    /// is not. GPX import is reachable both ways — through the file picker, which closes
+    /// the planner first, and through `onOpenURL` from the share sheet, which can land
+    /// while the planner is still up — and the alert is bound behind the planner.
+    private func report(_ message: String) {
+        if showRouteSheet {
+            routeError = message
+        } else {
+            session.lastError = message
         }
     }
 
