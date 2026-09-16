@@ -40,7 +40,7 @@ enum LocationEngineError: LocalizedError {
 
 /// Thin Swift wrapper around idevice’s DVT location simulation (injects into locationd).
 enum LocationEngine {
-    private static let queue = DispatchQueue(label: "com.chrismack.locus.location", qos: .userInitiated)
+    private static let queue = DispatchQueue(label: "com.ricepollution.locus.location", qos: .userInitiated)
 
     private static var adapter: OpaquePointer?
     private static var handshake: OpaquePointer?

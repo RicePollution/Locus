@@ -404,7 +404,7 @@
 					"-lc++",
 					"-lz",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.chrismack.locus;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ricepollution.locus;
 				PRODUCT_NAME = Locus;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
@@ -510,7 +510,7 @@
 					"-lc++",
 					"-lz",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.chrismack.locus;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ricepollution.locus;
 				PRODUCT_NAME = Locus;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;

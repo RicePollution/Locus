@@ -2,9 +2,9 @@
 
 ## 1. Sideload the IPA
 
-Install the latest IPA from [Releases](https://github.com/ChrisMack32/Locus/releases) (or build from source) with Feather, SideStore, AltStore, Sideloadly, or LiveContainer.
+Install the latest IPA from [Releases](https://github.com/RicePollution/Locus/releases) (or build from source) with Feather, SideStore, AltStore, Sideloadly, or LiveContainer.
 
-Bundle ID: `com.chrismack.locus`
+Bundle ID: `com.ricepollution.locus`
 
 ### LiveContainer
 

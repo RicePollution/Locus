@@ -9,6 +9,11 @@ Free and open-source iPhone location teleport. Tap the map, search a place, or d
   <img src="docs/screenshots/route.png" alt="Locus route on map" width="180" />
 </p>
 
+> **Fork.** This is [RicePollution/Locus](https://github.com/RicePollution/Locus), an independently
+> maintained fork of [ChrisMack32/Locus](https://github.com/ChrisMack32/Locus). It ships under its own
+> bundle ID (`com.ricepollution.locus`) and URL scheme, so it installs alongside the original instead of
+> replacing it. Same MIT license, same mechanism.
+
 ## Features
 
 - One-tap teleport (map pin or place search)
@@ -22,9 +27,9 @@ Free and open-source iPhone location teleport. Tap the map, search a place, or d
 
 ## Install
 
-See [SETUP.md](SETUP.md) for full steps. Grab a prebuilt IPA from [Releases](https://github.com/ChrisMack32/Locus/releases), or build from source below.
+See [SETUP.md](SETUP.md) for full steps. Grab a prebuilt IPA from [Releases](https://github.com/RicePollution/Locus/releases), or build from source below.
 
-Bundle ID: `com.chrismack.locus`
+Bundle ID: `com.ricepollution.locus`
 
 ### LiveContainer
 
@@ -79,4 +84,4 @@ xcodebuild -project Locus.xcodeproj -scheme Locus -configuration Release \
 
 ## License
 
-MIT. `Vendor/idevice` contains the idevice FFI (MIT). Locus is an independent open-source project and is not affiliated with Mirage / Wapixel.
+MIT — see [LICENSE](LICENSE). Forked from [ChrisMack32/Locus](https://github.com/ChrisMack32/Locus) (MIT); the upstream copyright notice is retained. `Vendor/idevice` contains the idevice FFI (MIT). Locus is an independent open-source project and is not affiliated with Mirage / Wapixel.

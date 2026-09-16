@@ -20,7 +20,7 @@ final class PairingStore: ObservableObject {
                 types.append(t)
             }
         }
-        if let custom = UTType("com.chrismack.locus.rppairing") {
+        if let custom = UTType("com.ricepollution.locus.rppairing") {
             types.append(custom)
         }
         return types

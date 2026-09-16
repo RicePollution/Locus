@@ -1,6 +1,6 @@
 name: Locus
 options:
-  bundleIdPrefix: com.chrismack
+  bundleIdPrefix: com.ricepollution
   deploymentTarget:
     iOS: "18.0"
   xcodeVersion: "16.0"
@@ -31,7 +31,7 @@ targets:
         buildPhase: none
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.chrismack.locus
+        PRODUCT_BUNDLE_IDENTIFIER: com.ricepollution.locus
         PRODUCT_NAME: Locus
         MARKETING_VERSION: "1.0.2"
         CURRENT_PROJECT_VERSION: "3"

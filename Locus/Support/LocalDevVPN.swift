@@ -6,8 +6,8 @@ enum LocalDevVPN {
     static let appStoreURL = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
     static let detectURL = URL(string: "localdevvpn://")!
 
-    /// Starts the tunnel, then returns to Locus via `locus://`.
-    static let enableURL = URL(string: "localdevvpn://enable?scheme=locus")!
+    /// Starts the tunnel, then returns to Locus via `rplocus://`.
+    static let enableURL = URL(string: "localdevvpn://enable?scheme=rplocus")!
 
     static var isInstalled: Bool {
         UIApplication.shared.canOpenURL(detectURL)

@@ -95,7 +95,7 @@
 			<key>UTTypeDescription</key>
 			<string>Remote Pairing File</string>
 			<key>UTTypeIdentifier</key>
-			<string>com.chrismack.locus.rppairing</string>
+			<string>com.ricepollution.locus.rppairing</string>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>
@@ -117,10 +117,10 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.chrismack.locus</string>
+			<string>com.ricepollution.locus</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>locus</string>
+				<string>rplocus</string>
 			</array>
 		</dict>
 	</array>
