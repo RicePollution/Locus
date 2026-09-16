@@ -66,6 +66,22 @@ xcodebuild -project Locus.xcodeproj -scheme Locus -configuration Release \
 - There is no test target, no linter config, and no package manager. Verification is building and
   running on a paired device.
 
+## Evidence status of the port-discovery fix
+
+`RemotePairingDiscovery` exists because upstream issues #12 and #4 describe tunnels that
+fail despite a connected LocalDevVPN, and #4's "works for a day and then doesn't" fits a
+service that rebinds to a new ephemeral port across reboots. **That diagnosis is not
+confirmed.** Measured on a device 2026-09-15 (iOS 18-26): the port was **49152**, the
+value upstream hardcoded, so the rebind was not reproduced. The reporters were on iOS
+26.6 and 27.0 — iOS 27 reworked pairing — so the behaviour may not exist on earlier iOS
+at all, and this repo's hardware may be unable to falsify it either way.
+
+Treat the discovery path as insurance, not a proven fix. It is built to cost nothing when
+the diagnosis is wrong: 49152 is tried first, Bonjour runs only after every candidate has
+failed at the tunnel layer, and with discovery inert the behaviour is identical to
+upstream's. Do not remove it on the strength of one negative reading, and do not claim it
+fixes #12/#4 until a device shows a port other than 49152.
+
 ## Architecture
 
 Three source groups under `Locus/`: `Engine/` (device plumbing, no SwiftUI), `Features/` (SwiftUI
