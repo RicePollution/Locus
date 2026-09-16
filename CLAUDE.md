@@ -159,6 +159,22 @@ All persistence is UserDefaults, no database: `locus.favorites` / `locus.recents
 `SavedPlace`, whose `id` is its `"lat,lon"` string), `locus.targetDeviceIP`, `locus.setupComplete`,
 `locus.setupInProgress`.
 
+## Building against a newer SDK than upstream
+
+`project.yml` pins `xcodeVersion: "16.0"`, and some upstream code is only correct for that
+SDK. Confirmed on device 2026-09-15: a plain `.onTapGesture` attached to a SwiftUI `Map`
+**is never delivered** when built against the iOS 26 SDK — MapKit consumes the touch first.
+Panning still works, because that is MapKit's own recognizer, so the map appears to accept
+nothing but scrolling. `MapHomeView` now uses a simultaneous `SpatialTapGesture`, which does
+not demand exclusivity.
+
+This is not in upstream's issue tracker because its reporters run prebuilt IPAs compiled
+against the old SDK; only people building from source hit it. Expect more of this class:
+`Support/Theme.swift` already notes that iOS 26 Liquid Glass draws outside its layout bounds
+and needs an explicit `contentShape` to keep hit-testing aligned. When UI "stops responding"
+after an SDK bump, suspect gesture delivery and hit-testing before suspecting the app logic —
+and instrument the handler to see whether it runs at all, rather than reasoning about it.
+
 ## Conventions and constraints
 
 - **`Locus/Resources/Info.plist` is hand-maintained** (`GENERATE_INFOPLIST_FILE: false`, and it is
