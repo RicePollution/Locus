@@ -107,7 +107,9 @@ screens), `Support/` (shared models and styling).
   consequences, and getting either backwards is a memory bug: the server must **outlive** the
   simulation, and it must still be **freed afterwards**. `cleanup()` frees simulation → server →
   handshake → adapter, which is that order. Upstream's comment claimed the call consumed the server
-  and nil'd the pointer on success, which leaked one `RemoteServerHandle` per tunnel build; the
+  and nil'd the pointer on success, which leaked one `RemoteServerHandle` per tunnel build — and that
+  handle *owns the transport*, so each one was a live socket and an open DVT channel on the device,
+  accumulating for the life of the process every time a dropped session rebuilt; the
   failure path, which frees it, was correct all along. Verify against the Rust source before
   changing any of this — the header does not say, and `remote_server_new` directly below it
   *does* document consumption explicitly, which is what makes the silence here meaningful.

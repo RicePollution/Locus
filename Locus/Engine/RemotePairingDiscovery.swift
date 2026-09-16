@@ -102,13 +102,18 @@ enum RemotePairingDiscovery {
                 case .failed:
                     finish(nil)
                 case .waiting(let error):
-                    // A denied Local Network permission parks the browser here rather than
-                    // failing it, so every exhausted teleport used to pay the full timeout
-                    // for a browse that was never going to return anything. Giving up costs
-                    // nothing: the caller falls back to the fixed port, which is the
-                    // behaviour before discovery existed.
-                    NSLog("[Locus] discovery browser waiting, giving up: %@", String(describing: error))
-                    finish(nil)
+                    // .waiting is Network.framework's *recoverable* state — the browser
+                    // returns to .ready on its own once a path exists. Discovery runs
+                    // exactly when the tunnel interface is likely mid-re-establishment,
+                    // so aborting here would throw away browses that were about to work.
+                    // A denied Local Network permission, though, parks it here forever.
+                    // Wait a beat and only give up if it has not recovered. finish() is
+                    // claim-guarded, so a late arrival here is harmless.
+                    NSLog("[Locus] discovery browser waiting: %@", String(describing: error))
+                    Task {
+                        try? await Task.sleep(nanoseconds: 700_000_000)
+                        if case .waiting = browser.state { finish(nil) }
+                    }
                 default:
                     break
                 }

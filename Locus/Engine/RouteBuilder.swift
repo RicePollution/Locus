@@ -35,27 +35,38 @@ enum RouteBuilder {
         to end: CLLocationCoordinate2D,
         mode: TravelMode
     ) async throws -> RoadRoute {
+        let primaryError: Error
         do {
             let coords = try await directions(from: start, to: end, transportType: mode.mkTransportType)
             return RoadRoute(coordinates: coords, fellBackToRoads: false)
         } catch {
-            // Only an actual "no such route" justifies retrying by road and telling the
-            // user their points are too far apart. A throttle, a server error or a dead
-            // network must say so instead — reporting those as geography sent offline
-            // users hunting for a problem with their destination.
-            guard routeGenuinelyUnavailable(error) else {
-                throw RouteError.lookupFailed(mode, underlying: error)
-            }
-            // MapKit refuses walking directions beyond a short distance, which is the
-            // usual cause of "directions not available" after teleporting somewhere far.
-            // Roads normally still connect the two points, so retry by car rather than
-            // failing outright; SpoofSession keeps using the chosen mode's speed.
-            guard mode.mkTransportType == .walking,
-                  let coords = try? await directions(from: start, to: end, transportType: .automobile) else {
-                throw RouteError.noRoute(mode)
-            }
-            return RoadRoute(coordinates: coords, fellBackToRoads: true)
+            primaryError = error
         }
+
+        // MapKit refuses walking directions beyond a short distance, which is the usual
+        // cause of "directions not available" after teleporting somewhere far. The road
+        // retry is one cheap extra request that can only help, so it is NEVER gated on
+        // how the first attempt failed — a throttled or offline first attempt often
+        // succeeds on the second. Classification decides the message, not the retry.
+        guard mode.mkTransportType == .walking else {
+            throw routeError(for: mode, attempts: [primaryError])
+        }
+        do {
+            let coords = try await directions(from: start, to: end, transportType: .automobile)
+            return RoadRoute(coordinates: coords, fellBackToRoads: true)
+        } catch {
+            throw routeError(for: mode, attempts: [primaryError, error])
+        }
+    }
+
+    /// Only claim the two points are unroutable when *every* attempt actually said so.
+    /// If any of them failed because MapKit could not go and look, report that instead —
+    /// telling an offline user their destination is unreachable is the misleading answer.
+    private static func routeError(for mode: TravelMode, attempts: [Error]) -> RouteError {
+        if let lookupFailure = attempts.first(where: { !routeGenuinelyUnavailable($0) }) {
+            return .lookupFailed(mode, underlying: lookupFailure)
+        }
+        return .noRoute(mode)
     }
 
     /// True only when MapKit is saying "there is no such route", as opposed to "I could
