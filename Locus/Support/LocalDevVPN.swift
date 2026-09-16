@@ -2,6 +2,14 @@ import Darwin
 import Foundation
 import UIKit
 
+/// How sure we are that the developer tunnel is reachable. Nothing here gates a
+/// teleport — the engine is the only thing that actually knows.
+enum TunnelReachability: Equatable {
+    case confirmed
+    case likely
+    case unknown
+}
+
 enum LocalDevVPN {
     static let appStoreURL = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
     static let detectURL = URL(string: "localdevvpn://")!
@@ -69,5 +77,20 @@ enum LocalDevVPN {
             ptr = interface.ifa_next
         }
         return results
+    }
+}
+
+extension LocalDevVPN {
+    /// `isConnected` only sees the tunnel when it lands on a local interface, so it reads
+    /// false for loopback-mode proxies (Clash, SingBox) whose tunnel works fine. An engine
+    /// round-trip that actually reached `confirmedTarget` outranks it, and a negative
+    /// interface scan is reported as "can't tell" rather than "not connected".
+    static func reachability(confirmedTarget: String?, proven: Bool = false) -> TunnelReachability {
+        if let confirmedTarget, confirmedTarget == TunnelConfig.targetIP { return .confirmed }
+        if isConnected { return .likely }
+        // The scan says no. If this exact IP has already answered once this process, the
+        // scan is demonstrably unreliable for this setup, so don't assert a disconnection
+        // we have disproved before. Only a never-worked IP is genuinely unknown.
+        return proven ? .likely : .unknown
     }
 }

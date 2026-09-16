@@ -18,6 +18,21 @@ struct SettingsView: View {
         return false
     }
 
+    private var tunnelReachability: TunnelReachability {
+        LocalDevVPN.reachability(
+            confirmedTarget: session.confirmedTunnelIP,
+            proven: session.provenTunnelIPs.contains(TunnelConfig.targetIP)
+        )
+    }
+
+    private var tunnelStatusLabel: String {
+        switch tunnelReachability {
+        case .confirmed: return "Connected"
+        case .likely: return "Looks connected"
+        case .unknown: return "Not detected"
+        }
+    }
+
     private var appVersion: String {
         let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
@@ -72,8 +87,15 @@ struct SettingsView: View {
                             TunnelConfig.setTargetIP(tunnelIP)
                         }
                     LabeledContent("Status") {
-                        Text(LocalDevVPN.isConnected ? "Connected" : "Not connected")
-                            .foregroundStyle(LocalDevVPN.isConnected ? LocusTheme.statusGood : LocusTheme.statusWarn)
+                        Text(tunnelStatusLabel)
+                            .foregroundStyle(tunnelReachability == .unknown ? LocusTheme.statusWarn : LocusTheme.statusGood)
+                    }
+                    if let port = session.activePort {
+                        LabeledContent("Tunnel port", value: String(port))
+                    } else if let port = session.lastTunnelPort {
+                        LabeledContent("Tunnel port", value: "\(port) (last used)")
+                    } else {
+                        LabeledContent("Tunnel port", value: "—")
                     }
                     Button("Save tunnel IP") {
                         TunnelConfig.setTargetIP(tunnelIP)
@@ -93,7 +115,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Tunnel")
                 } footer: {
-                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward.")
+                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row.")
                 }
 
                 Section("Privacy") {

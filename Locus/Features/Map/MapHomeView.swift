@@ -12,14 +12,24 @@ struct MapHomeView: View {
     @State private var routeStart: CLLocationCoordinate2D?
     @State private var routeEnd: CLLocationCoordinate2D?
     @State private var routeCoords: [CLLocationCoordinate2D] = []
+    /// Set after a route is built, imported, or taken from a drawing, so the planner
+    /// can confirm a route actually exists. Nil means "no route loaded".
+    @State private var routeStatus: String?
     @State private var isRouting = false
     @State private var showRouteSheet = false
     @State private var showGPXImporter = false
+    /// Set when the planner is dismissed specifically to open the GPX picker, so the
+    /// picker is presented from the sheet's real onDismiss rather than after a guessed delay.
+    @State private var openImporterAfterPlannerDismiss = false
     @State private var drawnPath: [CLLocationCoordinate2D] = []
     @State private var drawMode = false
     @State private var pinSelected = false
     @State private var isDraggingPin = false
-    @State private var suppressNextMapTap = false
+    /// Map taps are ignored until this instant. A pin drag that is cancelled rather than
+    /// ended never delivers onDragEnded, so a sticky Bool could leave the map permanently
+    /// untappable — panning still worked, which made it look like the map had taken over.
+    /// A deadline expires on its own, so the worst case is one lost tap.
+    @State private var suppressTapsUntil: Date = .distantPast
     /// Set when the pin comes from search / a named place so starring keeps the title.
     @State private var pinPlaceName: String?
 
@@ -47,40 +57,35 @@ struct MapHomeView: View {
                                 isDragging: isDraggingPin,
                                 onSelect: {
                                     searchFocused = false
-                                    suppressNextMapTap = true
+                                    suppressTapsUntil = Date().addingTimeInterval(0.15)
                                     withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
                                         pinSelected.toggle()
                                     }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                        suppressNextMapTap = false
-                                    }
                                 },
                                 onRemove: {
-                                    suppressNextMapTap = true
+                                    suppressTapsUntil = Date().addingTimeInterval(0.15)
                                     withAnimation {
                                         session.pin = nil
                                         pinSelected = false
                                     }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                        suppressNextMapTap = false
-                                    }
                                 },
                                 onDragBegan: {
                                     searchFocused = false
-                                    suppressNextMapTap = true
+                                    suppressTapsUntil = Date().addingTimeInterval(0.3)
                                     pinSelected = false
                                     isDraggingPin = true
                                 },
                                 onDragMoved: { globalPoint in
+                                    // Refresh the deadline as the drag runs, so it outlives the
+                                    // gesture only briefly if the gesture dies without ending.
+                                    suppressTapsUntil = Date().addingTimeInterval(0.3)
                                     if let coord = proxy.convert(globalPoint, from: .global) {
                                         session.pin = coord
                                     }
                                 },
                                 onDragEnded: {
                                     isDraggingPin = false
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                                        suppressNextMapTap = false
-                                    }
+                                    suppressTapsUntil = Date().addingTimeInterval(0.15)
                                 }
                             )
                         }
@@ -105,12 +110,16 @@ struct MapHomeView: View {
                 }
                 .mapStyle(mapStyle)
                 .mapControlVisibility(.hidden)
-                .onTapGesture { point in
-                    searchFocused = false
-                    guard !suppressNextMapTap, !isDraggingPin else { return }
-                    pinSelected = false
-                    placePin(at: point, proxy: proxy)
-                }
+                // MapKit consumes taps before a plain .onTapGesture on the Map is
+                // delivered when built against the iOS 26 SDK, so the handler never ran.
+                // A simultaneous gesture does not demand exclusivity, so the map keeps its
+                // own pan/zoom recognizers and we still see the tap.
+                .simultaneousGesture(
+                    SpatialTapGesture()
+                        .onEnded { value in
+                            handleMapTap(at: value.location, proxy: proxy)
+                        }
+                )
             }
             .background(Color.black.ignoresSafeArea())
 
@@ -124,24 +133,48 @@ struct MapHomeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .locusImportGPX)) { note in
             guard let url = note.object as? URL else { return }
-            importGPX(url)
+            // Arrives from the share sheet with no Locus UI open, so the planner can be
+            // shown immediately — nothing is mid-dismissal.
+            importGPX(url, reopenPlanner: true)
         }
         .fileImporter(isPresented: $showGPXImporter, allowedContentTypes: [.xml, .data], allowsMultipleSelection: false) { result in
             if case .success(let urls) = result, let url = urls.first {
-                importGPX(url)
+                // Do NOT re-present the planner here: this runs while the picker is still
+                // dismissing, so the presentation is silently dropped while the binding
+                // stays true, which would leave the planner permanently unreachable. The
+                // route drawn on the map is the confirmation; reopening it shows the status.
+                importGPX(url, reopenPlanner: false)
             }
         }
-        .sheet(isPresented: $showRouteSheet) {
+        .sheet(isPresented: $showRouteSheet, onDismiss: {
+            guard openImporterAfterPlannerDismiss else { return }
+            openImporterAfterPlannerDismiss = false
+            showGPXImporter = true
+        }) {
             RoutePlannerSheet(
                 start: $routeStart,
                 end: $routeEnd,
                 isRouting: $isRouting,
+                status: routeStatus,
                 onBuild: buildRoadRoute,
                 onPlay: playRoute,
-                onImportGPX: { showGPXImporter = true },
+                onImportGPX: {
+                    // The importer is attached to this view, which is covered while the
+                    // planner is up, and presenting from a controller that is already
+                    // presenting does nothing. Dismiss first and let onDismiss open the
+                    // picker, so this waits on the real signal instead of a fixed delay.
+                    openImporterAfterPlannerDismiss = true
+                    showRouteSheet = false
+                },
                 onExportGPX: exportGPX,
                 onUseDrawn: {
-                    routeCoords = RouteBuilder.sample(coordinates: drawnPath, every: 10)
+                    let sampled = RouteBuilder.sample(coordinates: drawnPath, every: 10)
+                    guard !sampled.isEmpty else {
+                        session.lastError = "Draw a path on the map first."
+                        return
+                    }
+                    routeCoords = sampled
+                    routeStatus = "Using drawn path — \(sampled.count) points. Tap Follow route."
                     drawnPath.removeAll()
                     drawMode = false
                 }
@@ -150,7 +183,22 @@ struct MapHomeView: View {
         }
     }
 
+    private func handleMapTap(at point: CGPoint, proxy: MapProxy) {
+        searchFocused = false
+        // A cancelled pin drag can leave isDraggingPin set with no onDragEnded to clear
+        // it. Once the suppression window has lapsed the drag is over whatever the flag
+        // says, so heal it rather than staying wedged.
+        if isDraggingPin, Date() >= suppressTapsUntil {
+            isDraggingPin = false
+        }
+        guard Date() >= suppressTapsUntil, !isDraggingPin else { return }
+        pinSelected = false
+        placePin(at: point, proxy: proxy)
+    }
+
     private func placePin(at point: CGPoint, proxy: MapProxy) {
+        // convert returns nil for a point outside the map's own bounds, which a
+        // simultaneous gesture can deliver. Nothing to report: ignore the tap.
         guard let coord = proxy.convert(point, from: .local) else { return }
         if drawMode {
             drawnPath.append(coord)
@@ -363,14 +411,18 @@ struct MapHomeView: View {
         isRouting = true
         Task {
             do {
-                let coords = try await RouteBuilder.roadRoute(from: start, to: end, mode: session.travelMode)
+                let route = try await RouteBuilder.roadRoute(from: start, to: end, mode: session.travelMode)
                 await MainActor.run {
-                    routeCoords = coords
+                    routeCoords = route.coordinates
+                    routeStatus = route.fellBackToRoads
+                        ? "Route ready — \(route.coordinates.count) points, following roads (no footpath route available). Tap Follow route."
+                        : "Route ready — \(route.coordinates.count) points. Tap Follow route."
                     isRouting = false
                 }
             } catch {
                 await MainActor.run {
                     isRouting = false
+                    routeStatus = nil
                     session.lastError = error.localizedDescription
                 }
             }
@@ -387,13 +439,17 @@ struct MapHomeView: View {
         session.followRoute(path, pairing: pairing)
     }
 
-    private func importGPX(_ url: URL) {
+    private func importGPX(_ url: URL, reopenPlanner: Bool) {
         do {
             let coords = try GPXCodec.parse(url)
             routeCoords = RouteBuilder.sample(coordinates: coords, every: 10)
+            routeStatus = "Imported \(coords.count) GPX points (\(routeCoords.count) after sampling). Tap Follow route."
             if let first = coords.first {
                 session.pin = first
                 position = .region(MKCoordinateRegion(center: first, latitudinalMeters: 2000, longitudinalMeters: 2000))
+            }
+            if reopenPlanner {
+                showRouteSheet = true
             }
         } catch {
             session.lastError = error.localizedDescription
@@ -413,7 +469,18 @@ struct MapHomeView: View {
             let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
             if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
                let root = scene.keyWindow?.rootViewController {
-                root.present(av, animated: true)
+                // The planner sheet is usually still up; presenting from the root while
+                // it is presenting does nothing, so walk to the topmost controller.
+                var top = root
+                while let presented = top.presentedViewController { top = presented }
+                // iPad is a supported device family, and a popover without a source
+                // anchor traps on presentation.
+                if let popover = av.popoverPresentationController {
+                    popover.sourceView = top.view
+                    popover.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.maxY, width: 0, height: 0)
+                    popover.permittedArrowDirections = []
+                }
+                top.present(av, animated: true)
             }
         } catch {
             session.lastError = error.localizedDescription

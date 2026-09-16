@@ -41,7 +41,7 @@ struct StatusBarView: View {
     @EnvironmentObject private var session: SpoofSession
     @Environment(\.scenePhase) private var scenePhase
 
-    @State private var tunnelConnected = LocalDevVPN.isConnected
+    @State private var tunnelReachability = LocalDevVPN.reachability(confirmedTarget: nil)
 
     private enum Display {
         case notSpoofing
@@ -52,7 +52,10 @@ struct StatusBarView: View {
     private var display: Display {
         switch session.status {
         case .idle:
-            return tunnelConnected ? .notSpoofing : .connectVPN
+            // Prompt only for an IP that has never answered here. A setup whose tunnel
+            // the interface scan cannot see reads .likely once it has worked once, so the
+            // loopback-proxy case stops being nagged.
+            return tunnelReachability == .unknown ? .connectVPN : .notSpoofing
         case .connecting:
             return .status("Connecting…")
         case .active:
@@ -151,7 +154,10 @@ struct StatusBarView: View {
     }
 
     private func refreshTunnel() {
-        tunnelConnected = LocalDevVPN.isConnected
+        tunnelReachability = LocalDevVPN.reachability(
+            confirmedTarget: session.confirmedTunnelIP,
+            proven: session.provenTunnelIPs.contains(TunnelConfig.targetIP)
+        )
     }
 }
 
