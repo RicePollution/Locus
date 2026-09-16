@@ -469,14 +469,22 @@ struct MapHomeView: View {
     /// Changing an endpoint without rebuilding used to leave the alternates, the drawn
     /// polyline and the ETA all describing the previous pair, which is worse than having
     /// no route at all: the numbers are specific, confident, and about somewhere else.
+    /// Deliberately blind to the *resolved* start. That one floats on `session.simulated`,
+    /// which moves continuously while a route is being followed — keying staleness to it
+    /// would light the warning up permanently the moment playback starts, for a route
+    /// that is doing exactly what was asked. Staleness means the user changed their mind,
+    /// not that they moved.
     private var routeIsStale: Bool {
-        guard let built = routeBuiltFor, let current = currentEndpoints else { return false }
-        return built != current
-    }
-
-    private var currentEndpoints: RouteEndpoints? {
-        guard let start = resolvedRouteStart, let end = routeEnd ?? session.pin else { return nil }
-        return RouteEndpoints(start: start, end: end)
+        guard let built = routeBuiltFor else { return false }
+        if let end = routeEnd ?? session.pin,
+           end.latitude != built.endLatitude || end.longitude != built.endLongitude {
+            return true
+        }
+        if let start = routeStart,
+           start.latitude != built.startLatitude || start.longitude != built.startLongitude {
+            return true
+        }
+        return false
     }
 
     private func cancelRouteBuild() {
