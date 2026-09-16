@@ -22,7 +22,11 @@ struct MapHomeView: View {
     @State private var drawMode = false
     @State private var pinSelected = false
     @State private var isDraggingPin = false
-    @State private var suppressNextMapTap = false
+    /// Map taps are ignored until this instant. A pin drag that is cancelled rather than
+    /// ended never delivers onDragEnded, so a sticky Bool could leave the map permanently
+    /// untappable — panning still worked, which made it look like the map had taken over.
+    /// A deadline expires on its own, so the worst case is one lost tap.
+    @State private var suppressTapsUntil: Date = .distantPast
     /// Set when the pin comes from search / a named place so starring keeps the title.
     @State private var pinPlaceName: String?
 
@@ -50,40 +54,35 @@ struct MapHomeView: View {
                                 isDragging: isDraggingPin,
                                 onSelect: {
                                     searchFocused = false
-                                    suppressNextMapTap = true
+                                    suppressTapsUntil = Date().addingTimeInterval(0.15)
                                     withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
                                         pinSelected.toggle()
                                     }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                        suppressNextMapTap = false
-                                    }
                                 },
                                 onRemove: {
-                                    suppressNextMapTap = true
+                                    suppressTapsUntil = Date().addingTimeInterval(0.15)
                                     withAnimation {
                                         session.pin = nil
                                         pinSelected = false
                                     }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                        suppressNextMapTap = false
-                                    }
                                 },
                                 onDragBegan: {
                                     searchFocused = false
-                                    suppressNextMapTap = true
+                                    suppressTapsUntil = Date().addingTimeInterval(0.3)
                                     pinSelected = false
                                     isDraggingPin = true
                                 },
                                 onDragMoved: { globalPoint in
+                                    // Refresh the deadline as the drag runs, so it outlives the
+                                    // gesture only briefly if the gesture dies without ending.
+                                    suppressTapsUntil = Date().addingTimeInterval(0.3)
                                     if let coord = proxy.convert(globalPoint, from: .global) {
                                         session.pin = coord
                                     }
                                 },
                                 onDragEnded: {
                                     isDraggingPin = false
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                                        suppressNextMapTap = false
-                                    }
+                                    suppressTapsUntil = Date().addingTimeInterval(0.15)
                                 }
                             )
                         }
@@ -110,7 +109,13 @@ struct MapHomeView: View {
                 .mapControlVisibility(.hidden)
                 .onTapGesture { point in
                     searchFocused = false
-                    guard !suppressNextMapTap, !isDraggingPin else { return }
+                    // A cancelled drag can leave isDraggingPin set with no onDragEnded to
+                    // clear it. Once the suppression window has lapsed the drag is over
+                    // whatever the flag says, so heal it rather than staying wedged.
+                    if isDraggingPin, Date() >= suppressTapsUntil {
+                        isDraggingPin = false
+                    }
+                    guard Date() >= suppressTapsUntil, !isDraggingPin else { return }
                     pinSelected = false
                     placePin(at: point, proxy: proxy)
                 }
