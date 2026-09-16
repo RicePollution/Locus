@@ -12,9 +12,12 @@ struct RoadRoute {
 
 enum RouteError: LocalizedError {
     case noRoute(TravelMode)
+    case lookupFailed(TravelMode, underlying: Error)
 
     var errorDescription: String? {
         switch self {
+        case .lookupFailed(let mode, let underlying):
+            return "Couldn't fetch \(mode.title.lowercased()) directions: \(underlying.localizedDescription)"
         case .noRoute(let mode):
             return "Apple Maps has no \(mode.title.lowercased()) route between those two points. "
                 + "They may be too far apart, or separated by water. Try an end point closer to "
@@ -36,6 +39,13 @@ enum RouteBuilder {
             let coords = try await directions(from: start, to: end, transportType: mode.mkTransportType)
             return RoadRoute(coordinates: coords, fellBackToRoads: false)
         } catch {
+            // Only an actual "no such route" justifies retrying by road and telling the
+            // user their points are too far apart. A throttle, a server error or a dead
+            // network must say so instead — reporting those as geography sent offline
+            // users hunting for a problem with their destination.
+            guard routeGenuinelyUnavailable(error) else {
+                throw RouteError.lookupFailed(mode, underlying: error)
+            }
             // MapKit refuses walking directions beyond a short distance, which is the
             // usual cause of "directions not available" after teleporting somewhere far.
             // Roads normally still connect the two points, so retry by car rather than
@@ -45,6 +55,20 @@ enum RouteBuilder {
                 throw RouteError.noRoute(mode)
             }
             return RoadRoute(coordinates: coords, fellBackToRoads: true)
+        }
+    }
+
+    /// True only when MapKit is saying "there is no such route", as opposed to "I could
+    /// not go and look". Anything unrecognised is treated as a lookup failure, since
+    /// claiming two points are unreachable is the more misleading of the two answers.
+    private static func routeGenuinelyUnavailable(_ error: Error) -> Bool {
+        if error is NoRoutesFound { return true }
+        guard let mkError = error as? MKError else { return false }
+        switch mkError.code {
+        case .directionsNotFound, .placemarkNotFound:
+            return true
+        default:
+            return false
         }
     }
 

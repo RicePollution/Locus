@@ -98,7 +98,20 @@ enum RemotePairingDiscovery {
             }
 
             browser.stateUpdateHandler = { state in
-                if case .failed = state { finish(nil) }
+                switch state {
+                case .failed:
+                    finish(nil)
+                case .waiting(let error):
+                    // A denied Local Network permission parks the browser here rather than
+                    // failing it, so every exhausted teleport used to pay the full timeout
+                    // for a browse that was never going to return anything. Giving up costs
+                    // nothing: the caller falls back to the fixed port, which is the
+                    // behaviour before discovery existed.
+                    NSLog("[Locus] discovery browser waiting, giving up: %@", String(describing: error))
+                    finish(nil)
+                default:
+                    break
+                }
             }
 
             browser.browseResultsChangedHandler = { results, _ in

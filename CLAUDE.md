@@ -101,8 +101,16 @@ screens), `Support/` (shared models and styling).
   `RemotePairingDiscovery` supplies candidates (last-known-good, then `49152`, then a Bonjour
   `_remotepairing._tcp` result) and the rebuild only advances to the next candidate on a
   `tunnel_create_rppairing` failure, since codes 9/10/11 prove the port was right; and
-  `location_simulation_new` takes ownership of the remote server, so `remoteServer` is deliberately
-  set to `nil` afterwards to avoid a double free.
+  `location_simulation_new` **borrows** the remote server rather than consuming it. The Rust
+  (`ffi/src/dvt/location_simulation.rs`) does `&mut (*server).0` and never `Box::from_raw`s it, and
+  the simulation handle keeps that reference with its lifetime transmuted to `'static`. Two
+  consequences, and getting either backwards is a memory bug: the server must **outlive** the
+  simulation, and it must still be **freed afterwards**. `cleanup()` frees simulation → server →
+  handshake → adapter, which is that order. Upstream's comment claimed the call consumed the server
+  and nil'd the pointer on success, which leaked one `RemoteServerHandle` per tunnel build; the
+  failure path, which frees it, was correct all along. Verify against the Rust source before
+  changing any of this — the header does not say, and `remote_server_new` directly below it
+  *does* document consumption explicitly, which is what makes the silence here meaningful.
   FFI integer codes are mapped to messages in `LocationEngineError.from(code:)` — those constants
   mirror the Rust side and must stay in sync with the private `Int32` constants above them. Code `4`
   (`portUnavailable`) is ours, not Rust's.
