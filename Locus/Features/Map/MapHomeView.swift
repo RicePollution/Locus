@@ -107,25 +107,16 @@ struct MapHomeView: View {
                 }
                 .mapStyle(mapStyle)
                 .mapControlVisibility(.hidden)
-                .onTapGesture { point in
-                    NSLog("[LocusTap] FIRED at %@  drawMode=%@ isDraggingPin=%@ suppressed=%@",
-                          String(describing: point), String(describing: drawMode),
-                          String(describing: isDraggingPin),
-                          String(describing: Date() < suppressTapsUntil))
-                    searchFocused = false
-                    // A cancelled drag can leave isDraggingPin set with no onDragEnded to
-                    // clear it. Once the suppression window has lapsed the drag is over
-                    // whatever the flag says, so heal it rather than staying wedged.
-                    if isDraggingPin, Date() >= suppressTapsUntil {
-                        isDraggingPin = false
-                    }
-                    guard Date() >= suppressTapsUntil, !isDraggingPin else {
-                        NSLog("[LocusTap] SWALLOWED by guard")
-                        return
-                    }
-                    pinSelected = false
-                    placePin(at: point, proxy: proxy)
-                }
+                // MapKit consumes taps before a plain .onTapGesture on the Map is
+                // delivered when built against the iOS 26 SDK, so the handler never ran.
+                // A simultaneous gesture does not demand exclusivity, so the map keeps its
+                // own pan/zoom recognizers and we still see the tap.
+                .simultaneousGesture(
+                    SpatialTapGesture()
+                        .onEnded { value in
+                            handleMapTap(at: value.location, proxy: proxy)
+                        }
+                )
             }
             .background(Color.black.ignoresSafeArea())
 
@@ -178,6 +169,26 @@ struct MapHomeView: View {
             )
             .presentationDetents([.medium, .large])
         }
+    }
+
+    private func handleMapTap(at point: CGPoint, proxy: MapProxy) {
+        NSLog("[LocusTap] FIRED at %@  drawMode=%@ isDraggingPin=%@ suppressed=%@",
+              String(describing: point), String(describing: drawMode),
+              String(describing: isDraggingPin),
+              String(describing: Date() < suppressTapsUntil))
+        searchFocused = false
+        // A cancelled pin drag can leave isDraggingPin set with no onDragEnded to clear
+        // it. Once the suppression window has lapsed the drag is over whatever the flag
+        // says, so heal it rather than staying wedged.
+        if isDraggingPin, Date() >= suppressTapsUntil {
+            isDraggingPin = false
+        }
+        guard Date() >= suppressTapsUntil, !isDraggingPin else {
+            NSLog("[LocusTap] SWALLOWED by guard")
+            return
+        }
+        pinSelected = false
+        placePin(at: point, proxy: proxy)
     }
 
     private func placePin(at point: CGPoint, proxy: MapProxy) {
