@@ -181,6 +181,32 @@ final class SpoofSession: ObservableObject {
         locationKeeper.lastKnownCoordinate
     }
 
+    /// Where the device actually is, as last seen with nothing simulated.
+    ///
+    /// Not `realCoordinate`. The keeper reports whatever `locationd` reports, and once a
+    /// spoof is running that is the *simulated* fix fed back to us — so the live value stops
+    /// describing the device and starts describing the lie. Anything reasoning about the
+    /// user's real position has to read this instead, and it refreshes only while `simulated`
+    /// is nil, which freezes it for the length of a session and releases it on stop.
+    ///
+    /// Freezing loses nothing: while spoofing, the app has no way to know the real position
+    /// anyway, and nothing it could send describes it, because the route starts from the
+    /// simulated point.
+    ///
+    /// Coarse by construction — the keeper asks for `kCLLocationAccuracyThreeKilometers` —
+    /// which is fine for an exclusion radius but is why no user-facing string may claim to
+    /// know exactly where the device is.
+    private(set) var lastUnspoofedCoordinate: CLLocationCoordinate2D?
+
+    /// The anchor the speed-limit exclusion is measured from, refreshed if and only if
+    /// nothing is currently simulated.
+    func exclusionAnchor() -> CLLocationCoordinate2D? {
+        if simulated == nil, let current = locationKeeper.lastKnownCoordinate {
+            lastUnspoofedCoordinate = current
+        }
+        return lastUnspoofedCoordinate
+    }
+
     /// Start lightweight GPS updates for the map puck / locate button.
     func startLocationUpdates() {
         locationKeeper.start()

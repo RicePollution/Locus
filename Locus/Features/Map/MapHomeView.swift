@@ -651,9 +651,12 @@ struct MapHomeView: View {
         }
         speedLimitStatus = "Speed limits: looking up…"
         let routeID = route.id
-        // Where the device physically is, withheld from the query by the service. Read here
-        // rather than inside the Task so it describes the moment the route was selected.
-        let real = session.realCoordinate
+        // Where the device physically is, withheld from the query by the service. The
+        // pre-spoof anchor rather than `realCoordinate`: once a spoof is running the keeper
+        // is reporting the simulated fix back to us, and excluding geometry around *that*
+        // both leaks nothing and blanks the first 500 m of every route. Read here rather
+        // than inside the Task so it describes the moment the route was selected.
+        let real = session.exclusionAnchor()
         // Tapping through the alternates calls this once per selection, and cancelling a
         // URLSession task does not stop Overpass computing a query it already accepted — so
         // three taps would cost a volunteer server three full queries. Fire when the

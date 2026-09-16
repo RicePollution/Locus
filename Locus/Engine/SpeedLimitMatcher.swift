@@ -34,6 +34,31 @@ enum SpeedLimitMatcher {
     /// Ceiling on subdivided segments. A single malformed way with a continent-spanning
     /// segment would otherwise subdivide into millions of pieces before anything noticed.
     static let maxSegments = 400_000
+    /// Furthest a projected point may sit from the route origin before the grid stops
+    /// considering it. Half the planet, so no real coordinate reaches it — it exists because
+    /// `Int(floor(x / cellSize))` traps on anything outside `Int`'s range, and a route
+    /// coordinate has never been range-checked the way a decoded way's has.
+    static let maxProjectedMagnitude: Double = 40_000_000
+
+    /// Metres from `point` to the segment `a`–`b`.
+    ///
+    /// Exposed because the Overpass corridor is drawn around the *segments* between the
+    /// coordinates it is given, not around the coordinates themselves — so anything deciding
+    /// what the corridor may cover has to measure the same thing the corridor does.
+    static func distance(
+        from point: CLLocationCoordinate2D,
+        toSegment a: CLLocationCoordinate2D,
+        _ b: CLLocationCoordinate2D
+    ) -> CLLocationDistance {
+        // Origin at the point, where the projection is most accurate and where the threshold
+        // that uses this actually matters.
+        let projection = Projection(origin: point)
+        return pointSegmentDistanceSquared(
+            px: 0, py: 0,
+            ax: projection.x(a.longitude), ay: projection.y(a.latitude),
+            bx: projection.x(b.longitude), by: projection.y(b.latitude)
+        ).squareRoot()
+    }
 
     /// Corridor radius the Overpass query must use for a polyline decimated at `tolerance`.
     ///
@@ -214,9 +239,14 @@ enum SpeedLimitMatcher {
         for index in 0..<rx.count {
             let px = rx[index]
             let py = ry[index]
-            // `Int(floor(nan))` traps. An unmatched point is a state the fallback chain
-            // already covers, so a junk coordinate takes that path instead.
-            guard px.isFinite, py.isFinite else { continue }
+            // `Int(floor(_:))` traps on non-finite values *and* on anything outside `Int`'s
+            // range, so finiteness alone is not the guard this needs — it wants a magnitude
+            // bound. Way coordinates get one from the decoder; route coordinates never have.
+            // A point this far out cannot be within `matchRadius` of anything anyway, and
+            // unmatched is a state the fallback chain already covers. `.magnitude <` is also
+            // false for NaN, so this subsumes the finiteness check.
+            guard px.magnitude < Self.maxProjectedMagnitude,
+                  py.magnitude < Self.maxProjectedMagnitude else { continue }
             let bearing = routeBearing(rx: rx, ry: ry, at: index)
             let cell = Segments.cellKey(Int(floor(px / cellSize)), Int(floor(py / cellSize)))
             guard let bucket = segments.grid[cell] else { continue }
@@ -322,7 +352,22 @@ enum SpeedLimitMatcher {
             xScale = cos(origin.latitude * .pi / 180) * 111_320
         }
 
-        func x(_ longitude: Double) -> Double { (longitude - lon0) * xScale }
+        /// The longitude delta is wrapped into ±180 before scaling. A route across the 180th
+        /// meridian steps from +179.99 to −179.99, which is 0.02° of ground and 359.98° of
+        /// arithmetic — unwrapped, that single leg reads as ~40,000 km, and the pacer then
+        /// walks it forever in 40 m steps, sweeping the device across the planet. Real on
+        /// Taveuni, Fiji, where the meridian crosses roads people drive; `MapHomeView.frame()`
+        /// guards the same case for the camera.
+        func x(_ longitude: Double) -> Double {
+            var delta = longitude - lon0
+            if delta > 180 {
+                delta -= 360
+            } else if delta < -180 {
+                delta += 360
+            }
+            return delta * xScale
+        }
+
         func y(_ latitude: Double) -> Double { (latitude - lat0) * 110_540 }
     }
 

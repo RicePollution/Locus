@@ -53,10 +53,12 @@ actor SpeedLimitService {
     static let serverTimeout = 25              // the [timeout:N] inside the QL
     static let requestTimeout: TimeInterval = 30
     static let resourceTimeout: TimeInterval = 60
-    /// Sized against the matcher rather than against the wire: decoding and subdividing a
-    /// maximal response costs tens of megabytes of transient allocation downstream, which is
-    /// the real spike, and no legitimate route inside the length cap comes close to 2 MB.
-    static let maxResponseBytes = 2 * 1024 * 1024
+    /// Has to clear what a route at `maxRouteLength` can legitimately return, or the cap
+    /// rejects valid answers instead of catching abusive ones. The design's worst measured
+    /// density is ~18 KB/km (midtown Manhattan), so 150 km is ~2.7 MB; 4 MB is that with
+    /// headroom. These two numbers are bound together — lowering this one without lowering
+    /// `maxRouteLength` reintroduces the mismatch.
+    static let maxResponseBytes = 4 * 1024 * 1024
     static let maxRouteLength: CLLocationDistance = 150_000
     static let retryDelays: [TimeInterval] = [2, 6]
     static let throttleCooldown: TimeInterval = 60
@@ -157,9 +159,9 @@ actor SpeedLimitService {
         guard decimated.coordinates.count >= 2 else {
             return .notApplicable(reason: "this route has no path to match")
         }
-        let runs = Self.runs(in: decimated.coordinates, excluding: realCoordinate)
+        let runs = Self.runs(in: decimated.coordinates, excluding: realCoordinate, radius: radius)
         guard !runs.isEmpty else {
-            return .notApplicable(reason: "route stays too close to your real location to look up")
+            return .notApplicable(reason: "route stays too close to your device's own location")
         }
 
         let key = Self.cacheKey(for: runs, radius: radius)
@@ -205,15 +207,22 @@ actor SpeedLimitService {
     /// Waiting rather than refusing: a second route selection is a legitimate gesture, and
     /// answering it with "unavailable, try again" would leave that route without a profile
     /// for good. A caller that has moved on cancels, and its wait dies here.
-    func reserveRequestSlot() async -> Bool {
+    private func reserveRequestSlot() async -> Bool {
         let now = Date()
         let slot = max(now, nextRequestAllowedAt)
-        nextRequestAllowedAt = slot.addingTimeInterval(Self.minimumRequestInterval)
+        let previous = nextRequestAllowedAt
+        let claimed = slot.addingTimeInterval(Self.minimumRequestInterval)
+        nextRequestAllowedAt = claimed
         let wait = min(slot.timeIntervalSince(now), 30)
         guard wait > 0 else { return true }
         do {
             try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
         } catch {
+            // Nothing went out, so the slot this call took has to go back. Without the
+            // rollback a run of abandoned selections walks the gate forward and delays a
+            // later request that never competed with anything. Only if nobody has claimed a
+            // slot behind us in the meantime — theirs is still pending and still owed.
+            if nextRequestAllowedAt == claimed { nextRequestAllowedAt = previous }
             return false
         }
         return true
@@ -327,22 +336,32 @@ actor SpeedLimitService {
     /// like a stretch the corridor missed for any other reason.
     static func runs(
         in coordinates: [CLLocationCoordinate2D],
-        excluding real: CLLocationCoordinate2D?
+        excluding real: CLLocationCoordinate2D?,
+        radius: Int
     ) -> [[CLLocationCoordinate2D]] {
         guard let real, real.latitude.isFinite, real.longitude.isFinite else {
             return coordinates.count >= 2 ? [coordinates] : []
         }
-        let anchor = CLLocation(latitude: real.latitude, longitude: real.longitude)
+        // Measured to the SEGMENT, not to the vertices, and against the exclusion plus the
+        // corridor's own radius. Testing vertices is the intuitive version and it does not
+        // work: Douglas–Peucker collapses a straight road to its two endpoints, so a route
+        // that runs past the device on a straight stretch has no vertex near it to split on,
+        // and the corridor Overpass draws between those two distant vertices still sweeps
+        // the street outside the door. Adding `radius` is what makes the exclusion cover the
+        // corridor rather than its centre line.
+        let threshold = realLocationRadius + Double(radius)
         var runs: [[CLLocationCoordinate2D]] = []
-        var current: [CLLocationCoordinate2D] = []
-        for coordinate in coordinates {
-            let point = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
-            guard anchor.distance(from: point) > realLocationRadius else {
+        var current: [CLLocationCoordinate2D] = coordinates.isEmpty ? [] : [coordinates[0]]
+        for (a, b) in zip(coordinates, coordinates.dropFirst()) {
+            guard SpeedLimitMatcher.distance(from: real, toSegment: a, b) > threshold else {
+                // This leg may not be sent, so the run ends here and the next one starts on
+                // the far side. A vertex inside the threshold is covered for free: both of
+                // its legs break, leaving it alone in a run of one, which is dropped below.
                 if current.count >= 2 { runs.append(current) }
-                current.removeAll(keepingCapacity: true)
+                current = [b]
                 continue
             }
-            current.append(coordinate)
+            current.append(b)
         }
         if current.count >= 2 { runs.append(current) }
         guard runs.count > maxQueryRuns else { return runs }
@@ -528,6 +547,14 @@ private final class OverpassRequest: NSObject, URLSessionDataDelegate {
                 self.task = task
                 lock.unlock()
                 task.resume()
+                // A cancel landing between the unlock and the resume would have cancelled a
+                // task that had not started, which on some releases delivers no completion
+                // at all and leaves this continuation waiting for a callback that never
+                // comes. Cancelling again after resume is idempotent and guarantees one.
+                lock.lock()
+                let cancelledDuringResume = cancelled
+                lock.unlock()
+                if cancelledDuringResume { task.cancel() }
             }
         } onCancel: {
             lock.lock()
