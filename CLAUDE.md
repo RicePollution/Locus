@@ -95,9 +95,10 @@ screens), `Support/` (shared models and styling).
   spoofing. It is an `enum` namespace holding four static `OpaquePointer` handles (adapter,
   handshake, remote server, location simulation), serialized by a private `DispatchQueue`. `set(...)`
   and `clear(...)` are `async` facades over that queue (`withCheckedContinuation` + `queue.async`) —
-  never `.sync`, because they are called from the main actor. `set(...)` first tries
-  `location_simulation_set` on the live handle; on any failure it tears everything down and rebuilds
-  the whole tunnel from the pairing file. Two details that bite: the tunnel port is a *guess* —
+  never `.sync`, because they are called from the main actor. `apply(...)` first tries
+  `location_simulation_set` on the live chain; a failure there does **not** tear anything down —
+  see "Arming" below, which is the one thing about this file that has changed most. Two details
+  that bite: the tunnel port is a *guess* —
   `RemotePairingDiscovery` supplies candidates (last-known-good, then `49152`, then a Bonjour
   `_remotepairing._tcp` result) and the rebuild only advances to the next candidate on a
   `tunnel_create_rppairing` failure, since codes 9/10/11 prove the port was right; and
@@ -105,7 +106,7 @@ screens), `Support/` (shared models and styling).
   (`ffi/src/dvt/location_simulation.rs`) does `&mut (*server).0` and never `Box::from_raw`s it, and
   the simulation handle keeps that reference with its lifetime transmuted to `'static`. Two
   consequences, and getting either backwards is a memory bug: the server must **outlive** the
-  simulation, and it must still be **freed afterwards**. `cleanup()` frees simulation → server →
+  simulation, and it must still be **freed afterwards**. `Chain.free()` frees simulation → server →
   handshake → adapter, which is that order. Upstream's comment claimed the call consumed the server
   and nil'd the pointer on success, which leaked one `RemoteServerHandle` per tunnel build — and that
   handle *owns the transport*, so each one was a live socket and an open DVT channel on the device,
@@ -116,12 +117,44 @@ screens), `Support/` (shared models and styling).
   FFI integer codes are mapped to messages in `LocationEngineError.from(code:)` — those constants
   mirror the Rust side and must stay in sync with the private `Int32` constants above them. Code `4`
   (`portUnavailable`) is ours, not Rust's.
+### Arming, and why Stop no longer frees the tunnel
+
+`tunnel_create_rppairing` **cannot establish on cellular**, but an already-established chain keeps
+working across the switch. `location_simulation_set` and `_clear` are `&mut self` calls on an open
+DVT channel and re-establish nothing, so once the chain exists, toggling spoofing is two messages
+down a live socket. Upstream's `clearLocked()` called `cleanup()` after a successful clear, so every
+Stop destroyed the tunnel and the next Teleport had to rebuild it — which on cellular simply fails.
+
+So the engine now holds three states — **disarmed** (no chain), **armed** (chain live, nothing
+asserted, real GPS), **spoofing** — and Stop drops to *armed*, not disarmed. Only an explicit Disarm
+or a dead chain frees anything. Measured on device 2026-09-18: armed on Wi‑Fi, switched to cellular,
+teleported — it spoofed. Arming still needs Wi‑Fi or Airplane Mode; this makes that limitation
+livable rather than removing it.
+
+Four things here are load-bearing:
+
+- **`Chain` is all-or-nothing.** Four *non-optional* pointers, built as locals and handed over only
+  when all four exist, so a partial chain is unrepresentable. Each free symbol appears exactly twice
+  in the file — `Chain.free()` and `buildLocked`'s unwind — and `chain = nil` appears in exactly two
+  functions. Those counts are the verification story; there is no test target.
+- **A failed message never frees.** A chain is torn down automatically only when the session is
+  *actively asserting* and the failure threshold is reached. Verify failures deliberately do not
+  count: if `location_simulation_clear` on an idle channel turns out to fail (still unmeasured),
+  counting them would walk the counter up while nothing is asserting and then free a healthy chain.
+- **`dispatchPrecondition(condition: .onQueue(queue))` on every `*Locked`.** With no tests this is
+  the only mechanised check that exists. It is not decoration.
+- **`.armed` must never render as `.idle`.** After a Stop the app still holds a privileged channel
+  into `locationd`; a chip reading "Not Spoofing" would make Locus quietly more invasive than the
+  person holding it believes. Collapsing those two for display is a regression, not a simplification.
+
 - **`SpoofSession`** (`Engine/SpoofSession.swift`) is the `@MainActor` `ObservableObject` that every
   view observes — the single source of truth for status, pin, simulated coordinate, favorites, and
   recents. It owns two repeating timers, both of which exist for a reason:
-  - **resend every 8s** — iOS drops the simulated fix if nothing re-asserts it. It keeps firing while
-    the status is `.dropped` (only `stop()` cancels it), so it is also the reconnect path that makes
-    a session survive Wi‑Fi → cellular;
+  - **resend every 8s** — iOS drops the simulated fix if nothing re-asserts it. The interval is
+    `ResendSettings.interval`, adjustable under Settings → Diagnostics purely so the gap can be
+    stretched to measure tunnel behaviour; 8s is the only cadence meant for real use. A *disarmed*
+    session retrying a lost chain uses the 8/16/32/60s rebuild ladder instead, because on cellular
+    a rebuild cannot succeed and a flat retry just sweeps candidate ports forever;
   - **joystick tick at 0.25s** — converts the pad vector into a metric offset at `TravelMode.baseSpeed`
     with ±10% jitter.
 

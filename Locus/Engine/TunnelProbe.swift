@@ -63,7 +63,7 @@ enum TunnelProbe {
         return .probed(targetIP: target, results: results)
     }
 
-    /// Same validation `LocationEngine.setLocked` does, run once before any socket is opened:
+    /// Same validation `LocationEngine.buildLocked` does, run once before any socket is opened:
     /// the IP is free text from the Settings field.
     private static func ipv4Address(_ text: String) -> in_addr_t? {
         var parsed = in_addr()
