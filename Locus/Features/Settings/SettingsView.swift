@@ -12,6 +12,8 @@ struct SettingsView: View {
     @State private var tunnelIP = TunnelConfig.targetIP
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
     @State private var useSpeedLimits = SpeedLimitSettings.isEnabled
+    @State private var probing = false
+    @State private var probeReport: TunnelProbeReport?
     @Environment(\.scenePhase) private var scenePhase
 
     private var supportsOnDevicePairing: Bool {
@@ -113,10 +115,19 @@ struct SettingsView: View {
                             systemImage: localDevVPNInstalled ? "lock.shield.fill" : "arrow.down.app.fill"
                         )
                     }
+                    Button {
+                        runTunnelProbe()
+                    } label: {
+                        Label(probing ? "Testing tunnel…" : "Test tunnel", systemImage: "stethoscope")
+                    }
+                    .disabled(probing)
+                    if let probeReport {
+                        probeRows(probeReport)
+                    }
                 } header: {
                     Text("Tunnel")
                 } footer: {
-                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row.")
+                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row. Test tunnel opens a plain TCP connection to each port the engine would try, sends nothing, and reports the raw errno — which separates packets that never arrived from a handshake that failed after they did.")
                 }
 
                 Section {
@@ -203,6 +214,56 @@ struct SettingsView: View {
                     localDevVPNInstalled = LocalDevVPN.isInstalled
                 }
             }
+        }
+    }
+
+    /// Probes the IP as typed rather than as stored, so the field can be tested before it is
+    /// saved. Nothing here touches the engine, so it is safe mid-session.
+    private func runTunnelProbe() {
+        probing = true
+        probeReport = nil
+        let target = tunnelIP
+        Task {
+            probeReport = await TunnelProbe.run(targetIP: target)
+            probing = false
+        }
+    }
+
+    @ViewBuilder
+    private func probeRows(_ report: TunnelProbeReport) -> some View {
+        switch report {
+        case .invalidIP(let ip):
+            VStack(alignment: .leading, spacing: 2) {
+                Text(ip.isEmpty ? "No tunnel IP" : "\(ip) is not an IPv4 address")
+                    .foregroundStyle(LocusTheme.statusBad)
+                Text("Nothing was sent. Enter a dotted-quad address such as 10.7.0.1.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .probed(let ip, let results):
+            ForEach(results) { result in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("\(ip):\(String(result.port))")
+                            .font(.subheadline.monospaced())
+                        Spacer()
+                        Text(result.status)
+                            .font(.subheadline)
+                            .foregroundStyle(probeColor(result))
+                    }
+                    Text(result.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func probeColor(_ result: TunnelProbeResult) -> Color {
+        switch result.outcome {
+        case .connected: return LocusTheme.statusGood
+        case .failed, .timedOut: return LocusTheme.statusWarn
+        case .setupFailed: return LocusTheme.statusBad
         }
     }
 }
