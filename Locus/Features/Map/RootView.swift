@@ -42,6 +42,9 @@ struct StatusBarView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var tunnelReachability = LocalDevVPN.reachability(confirmedTarget: nil)
+    /// Ticked by the 2s refresh loop so the armed age counts up. Only advanced while armed,
+    /// so an idle chip re-renders no more often than it did before.
+    @State private var clock = Date()
 
     private enum Display {
         case notSpoofing
@@ -58,6 +61,11 @@ struct StatusBarView: View {
             return tunnelReachability == .unknown ? .connectVPN : .notSpoofing
         case .connecting:
             return .status("Connecting…")
+        case .armed(let verifiedAt):
+            // Never "Not Spoofing": the tunnel into locationd is open either way, and this
+            // chip is the only thing on screen that says so.
+            guard let verifiedAt, isFresh(verifiedAt) else { return .status("Armed — unverified") }
+            return .status("Armed · \(Int(max(0, clock.timeIntervalSince(verifiedAt))))s")
         case .active:
             return .status("Spoofing")
         case .reconnecting:
@@ -76,11 +84,19 @@ struct StatusBarView: View {
         case .status:
             switch session.status {
             case .active: return LocusTheme.statusGood
+            // Dimmed green reads as ready rather than running, which is what armed is.
+            case .armed(let verifiedAt):
+                return isFresh(verifiedAt) ? LocusTheme.statusGood.opacity(0.55) : LocusTheme.statusWarn
             case .connecting, .reconnecting: return LocusTheme.statusWarn
             case .dropped: return LocusTheme.statusBad
             case .idle: return Color.primary.opacity(0.55)
             }
         }
+    }
+
+    private func isFresh(_ verifiedAt: Date?) -> Bool {
+        guard let verifiedAt else { return false }
+        return clock.timeIntervalSince(verifiedAt) < SpoofSession.unverifiedGrace
     }
 
     private var title: String {
@@ -108,6 +124,7 @@ struct StatusBarView: View {
         }
         .onChange(of: session.status) { _, _ in
             refreshTunnel()
+            clock = Date()
         }
         .onReceive(NotificationCenter.default.publisher(for: .NEVPNStatusDidChange)) { _ in
             // LocalDevVPN connection changes show up here even though we don’t own the VPN.
@@ -118,6 +135,7 @@ struct StatusBarView: View {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 refreshTunnel()
+                if case .armed = session.status { clock = Date() }
             }
         }
     }
@@ -185,6 +203,7 @@ struct StatusBarView: View {
 struct BottomControlsView: View {
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Binding var showSettings: Bool
     @Binding var showPlaces: Bool
 
@@ -217,7 +236,8 @@ struct BottomControlsView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                Spacer(minLength: 0)
+                Spacer(minLength: 4)
+                armControl
             }
 
             HStack(spacing: 10) {
@@ -287,6 +307,56 @@ struct BottomControlsView: View {
         .locusGlass(.regular, in: trayShape)
         // Whole tray absorbs taps so near-misses don't fall through to the map.
         .contentShape(trayShape)
+    }
+
+    /// Arming and disarming live on the primary surface rather than behind the gear. Disarm
+    /// is the control that gives up a privileged channel into locationd, so it cannot sit two
+    /// taps further away than the chip that announces the channel is open.
+    ///
+    /// Deliberately not shaped like Stop. Stop leaves the tunnel open and is a wide solid red
+    /// capsule in the action row; Disarm closes it and is a tinted pill up here. The two have
+    /// different consequences and must not be confusable.
+    @ViewBuilder
+    private var armControl: some View {
+        if session.armState == .disarmed {
+            armButton(title: "Arm", icon: "bolt.horizontal.circle.fill", fill: Color.primary.opacity(0.08), foreground: .primary) {
+                session.arm(pairing: pairing)
+            }
+            .disabled(session.isBusy)
+        } else {
+            armButton(title: "Disarm", icon: "bolt.slash.fill", fill: LocusTheme.danger.opacity(0.18), foreground: LocusTheme.danger) {
+                session.disarm()
+            }
+        }
+    }
+
+    private func armButton(
+        title: String,
+        icon: String,
+        fill: Color,
+        foreground: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                // The row is four fixed 44pt capsules and this pill, all of it `fixedSize`.
+                // At accessibility sizes the word no longer fits beside them and would push
+                // the row out of the tray, so the icon carries it alone.
+                if !dynamicTypeSize.isAccessibilitySize {
+                    Text(title).lineLimit(1)
+                }
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 10)
+            .frame(height: 40)
+            .background(Capsule().fill(fill))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .accessibilityLabel(title)
     }
 
     private func trayIcon(_ systemName: String, action: @escaping () -> Void) -> some View {

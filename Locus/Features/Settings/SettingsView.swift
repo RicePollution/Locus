@@ -12,6 +12,10 @@ struct SettingsView: View {
     @State private var tunnelIP = TunnelConfig.targetIP
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
     @State private var useSpeedLimits = SpeedLimitSettings.isEnabled
+    @State private var probing = false
+    @State private var probeReport: TunnelProbeReport?
+    @State private var resendInterval = ResendSettings.interval
+    @State private var pendingTunnelIP: String?
     @Environment(\.scenePhase) private var scenePhase
 
     private var supportsOnDevicePairing: Bool {
@@ -32,6 +36,21 @@ struct SettingsView: View {
         case .likely: return "Looks connected"
         case .unknown: return "Not detected"
         }
+    }
+
+    private var tunnelStateLabel: String {
+        switch session.armState {
+        case .disarmed: return "Disarmed"
+        case .armed:
+            guard let verified = session.lastVerified else { return "Armed — unverified" }
+            return "Armed — verified \(Self.age(verified))"
+        case .spoofing: return "Spoofing"
+        }
+    }
+
+    private static func age(_ date: Date) -> String {
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        return seconds < 60 ? "\(seconds)s ago" : "\(seconds / 60)m ago"
     }
 
     private var appVersion: String {
@@ -69,6 +88,10 @@ struct SettingsView: View {
                     }
                     if pairing.hasPairingFile {
                         Button("Remove pairing file", role: .destructive) {
+                            // A live chain does not need the file, so removing it would
+                            // otherwise leave a privileged channel open with nothing left
+                            // on the device authorising it.
+                            session.disarm()
                             try? pairing.removePairing()
                         }
                     }
@@ -85,11 +108,22 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .onSubmit {
-                            TunnelConfig.setTargetIP(tunnelIP)
+                            commitTunnelIP()
                         }
                     LabeledContent("Status") {
                         Text(tunnelStatusLabel)
                             .foregroundStyle(tunnelReachability == .unknown ? LocusTheme.statusWarn : LocusTheme.statusGood)
+                    }
+                    LabeledContent("Tunnel state") {
+                        Text(tunnelStateLabel)
+                            .foregroundStyle(session.armState == .disarmed ? Color.secondary : LocusTheme.statusGood)
+                    }
+                    if session.armState != .disarmed {
+                        // Secondary to the main screen's pill, which is the primary control;
+                        // this one is here because it is where the tunnel rows are read.
+                        Button("Disarm tunnel", role: .destructive) {
+                            session.disarm()
+                        }
                     }
                     if let port = session.activePort {
                         LabeledContent("Tunnel port", value: String(port))
@@ -99,7 +133,7 @@ struct SettingsView: View {
                         LabeledContent("Tunnel port", value: "—")
                     }
                     Button("Save tunnel IP") {
-                        TunnelConfig.setTargetIP(tunnelIP)
+                        commitTunnelIP()
                     }
                     Button {
                         if localDevVPNInstalled {
@@ -113,10 +147,55 @@ struct SettingsView: View {
                             systemImage: localDevVPNInstalled ? "lock.shield.fill" : "arrow.down.app.fill"
                         )
                     }
+                    Button {
+                        runTunnelProbe()
+                    } label: {
+                        Label(probing ? "Testing tunnel…" : "Test tunnel", systemImage: "stethoscope")
+                    }
+                    .disabled(probing)
+                    if let probeReport {
+                        probeRows(probeReport)
+                    }
+                    if let detail = session.lastFailureDetail {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Last tunnel error")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(detail)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(LocusTheme.statusWarn)
+                        }
+                    }
                 } header: {
                     Text("Tunnel")
                 } footer: {
-                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row.")
+                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Arming opens the developer tunnel without changing your location — do it on Wi‑Fi, because opening the tunnel does not work on cellular, but a tunnel that is already open keeps working when you leave Wi‑Fi. Stopping a spoof leaves it open; Disarm closes it, and you will need Wi‑Fi to arm again. Both controls are on the main screen beside the travel modes. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row. Test tunnel opens a plain TCP connection to each port the engine would try, sends nothing, and reports the raw errno — which separates packets that never arrived from a handshake that failed after they did.")
+                }
+
+                Section {
+                    Picker("Resend interval", selection: $resendInterval) {
+                        ForEach(ResendSettings.options, id: \.self) { value in
+                            Text(value == ResendSettings.standard
+                                 ? "\(Int(value))s (normal)"
+                                 : "\(Int(value))s")
+                                .tag(value)
+                        }
+                    }
+                    .onChange(of: resendInterval) { _, value in
+                        ResendSettings.setInterval(value)
+                    }
+                    if resendInterval != ResendSettings.standard {
+                        Label(
+                            "Spoofing will lapse between ticks at \(Int(resendInterval))s.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(LocusTheme.statusWarn)
+                    }
+                } header: {
+                    Text("Diagnostics")
+                } footer: {
+                    Text("A running spoof re-asserts its position every 8 seconds because iOS expires a simulated fix that nothing renews. Raising this is a measurement, not a setting to leave changed: it asks whether the developer tunnel survives being idle, or whether iOS hangs up on a channel nobody is using. Teleport once, wait out the interval, and watch what the next tick does — if the position simply lapses and then snaps back, the tunnel held; if the session drops with an error, the tunnel died while idle. That answer decides whether Locus can hold a tunnel open across a Stop so a spoof can be started later without rebuilding it. Takes effect on the next teleport. Set this back to 8s for normal use.")
                 }
 
                 Section {
@@ -169,10 +248,30 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {
-                        TunnelConfig.setTargetIP(tunnelIP)
-                        dismiss()
+                        commitTunnelIP()
+                        // A conflicting IP raises the alert instead of saving, and dismissing
+                        // would take the alert with it.
+                        if pendingTunnelIP == nil { dismiss() }
                     }
                 }
+            }
+            .alert("Disarm and use \(pendingTunnelIP ?? "")?", isPresented: Binding(
+                get: { pendingTunnelIP != nil },
+                set: { if !$0 { pendingTunnelIP = nil } }
+            )) {
+                Button("Cancel", role: .cancel) {
+                    tunnelIP = session.confirmedTunnelIP ?? TunnelConfig.targetIP
+                    pendingTunnelIP = nil
+                }
+                Button("Disarm and save", role: .destructive) {
+                    if let pendingTunnelIP {
+                        TunnelConfig.setTargetIP(pendingTunnelIP)
+                    }
+                    session.disarm()
+                    pendingTunnelIP = nil
+                }
+            } message: {
+                Text("The open tunnel is on \(session.confirmedTunnelIP ?? "another address") and Locus cannot move it, so saving this address closes it. Opening one again needs Wi‑Fi.")
             }
             .sheet(isPresented: $showImporter) {
             PairingDocumentPicker(
@@ -203,6 +302,75 @@ struct SettingsView: View {
                     localDevVPNInstalled = LocalDevVPN.isInstalled
                 }
             }
+        }
+    }
+
+    /// A live chain is bound to the address it was built on and `apply` never re-dials, so
+    /// saving a different IP while armed would silently do nothing until the next build.
+    /// Closing the chain to pick the new address up is a one-way door on cellular, so it is
+    /// asked rather than done.
+    private func commitTunnelIP() {
+        let typed = tunnelIP.trimmingCharacters(in: .whitespaces)
+        // Nothing is being changed, so there is nothing to confirm.
+        guard typed != TunnelConfig.targetIP else { return }
+        // Being armed is the condition, not being armed on an address Locus can name:
+        // `confirmedTunnelIP` is nil for an arm whose probe never landed, and reading that
+        // as "no live chain" let the prompt be walked straight past — the save went through
+        // silently while a chain stayed open on the old address.
+        guard session.armState == .disarmed || typed == session.confirmedTunnelIP else {
+            pendingTunnelIP = typed
+            return
+        }
+        TunnelConfig.setTargetIP(typed)
+    }
+
+    /// Probes the IP as typed rather than as stored, so the field can be tested before it is
+    /// saved. Nothing here touches the engine, so it is safe mid-session.
+    private func runTunnelProbe() {
+        probing = true
+        probeReport = nil
+        let target = tunnelIP
+        Task {
+            probeReport = await TunnelProbe.run(targetIP: target)
+            probing = false
+        }
+    }
+
+    @ViewBuilder
+    private func probeRows(_ report: TunnelProbeReport) -> some View {
+        switch report {
+        case .invalidIP(let ip):
+            VStack(alignment: .leading, spacing: 2) {
+                Text(ip.isEmpty ? "No tunnel IP" : "\(ip) is not an IPv4 address")
+                    .foregroundStyle(LocusTheme.statusBad)
+                Text("Nothing was sent. Enter a dotted-quad address such as 10.7.0.1.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .probed(let ip, let results):
+            ForEach(results) { result in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("\(ip):\(String(result.port))")
+                            .font(.subheadline.monospaced())
+                        Spacer()
+                        Text(result.status)
+                            .font(.subheadline)
+                            .foregroundStyle(probeColor(result))
+                    }
+                    Text(result.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func probeColor(_ result: TunnelProbeResult) -> Color {
+        switch result.outcome {
+        case .connected: return LocusTheme.statusGood
+        case .failed, .timedOut: return LocusTheme.statusWarn
+        case .setupFailed: return LocusTheme.statusBad
         }
     }
 }
