@@ -523,9 +523,13 @@ final class SpoofSession: ObservableObject {
 
     /// Re-asserts the fix every 8s — iOS drops it otherwise. It keeps firing while the
     /// session is `.dropped`, which is also what brings a broken tunnel back.
+    ///
+    /// The interval is `ResendSettings.interval` rather than a literal so the gap can be
+    /// stretched to measure whether an idle tunnel survives; see that type. It is read once
+    /// here, so a change taken in Settings applies from the next teleport, not mid-session.
     private func startResend(pairing: PairingStore) {
         resendTimer?.invalidate()
-        resendTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
+        resendTimer = Timer.scheduledTimer(withTimeInterval: ResendSettings.interval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, let target = self.desired else { return }
                 self.enqueue(
@@ -592,4 +596,39 @@ final class SpoofSession: ObservableObject {
         let dLon = eastMeters / (earth * cos(coordinate.latitude * .pi / 180)) * (180 / .pi)
         return CLLocationCoordinate2D(latitude: coordinate.latitude + dLat, longitude: coordinate.longitude + dLon)
     }
+}
+
+/// How often a running session re-asserts its fix.
+///
+/// 8s is the shipped cadence and the only one meant for real use: iOS expires a simulated
+/// fix that nothing renews, so a longer gap lets the device drift back to its real position
+/// between ticks. This is adjustable to answer exactly one question — does an idle developer
+/// tunnel survive, or does `remoted` hang up on a channel nobody is using?
+///
+/// That answer decides whether holding a tunnel open across a Stop (an "armed" state) is
+/// worth building: arming is only useful if the channel is still alive when you reach for it
+/// later. Stretching this interval and watching the next resend is the cheapest way to
+/// measure it, and the two outcomes are distinguishable — a merely lapsed fix re-asserts
+/// cleanly on the same handle, whereas a dead channel fails and drops the session.
+enum ResendSettings {
+    static let defaultsKey = "locus.resendInterval"
+
+    /// The shipped cadence. Anything else is a diagnostic and will visibly lapse.
+    static let standard: TimeInterval = 8
+
+    /// Offered gaps, bracketing a plausible idle timeout.
+    static let options: [TimeInterval] = [8, 60, 180, 600]
+
+    static var interval: TimeInterval {
+        // `double(forKey:)` reports 0 for a missing key, and a value left over from an older
+        // build could strand the session on a cadence the picker cannot display or undo.
+        let stored = UserDefaults.standard.double(forKey: defaultsKey)
+        return options.contains(stored) ? stored : standard
+    }
+
+    static func setInterval(_ value: TimeInterval) {
+        UserDefaults.standard.set(value, forKey: defaultsKey)
+    }
+
+    static var isDiagnostic: Bool { interval != standard }
 }

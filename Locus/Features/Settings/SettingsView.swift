@@ -14,6 +14,7 @@ struct SettingsView: View {
     @State private var useSpeedLimits = SpeedLimitSettings.isEnabled
     @State private var probing = false
     @State private var probeReport: TunnelProbeReport?
+    @State private var resendInterval = ResendSettings.interval
     @Environment(\.scenePhase) private var scenePhase
 
     private var supportsOnDevicePairing: Bool {
@@ -128,6 +129,32 @@ struct SettingsView: View {
                     Text("Tunnel")
                 } footer: {
                     Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward. Proxies that keep the tunnel on loopback (Clash, SingBox) show as Not detected even when they work — teleporting is never blocked by this row. Test tunnel opens a plain TCP connection to each port the engine would try, sends nothing, and reports the raw errno — which separates packets that never arrived from a handshake that failed after they did.")
+                }
+
+                Section {
+                    Picker("Resend interval", selection: $resendInterval) {
+                        ForEach(ResendSettings.options, id: \.self) { value in
+                            Text(value == ResendSettings.standard
+                                 ? "\(Int(value))s (normal)"
+                                 : "\(Int(value))s")
+                                .tag(value)
+                        }
+                    }
+                    .onChange(of: resendInterval) { _, value in
+                        ResendSettings.setInterval(value)
+                    }
+                    if resendInterval != ResendSettings.standard {
+                        Label(
+                            "Spoofing will lapse between ticks at \(Int(resendInterval))s.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(LocusTheme.statusWarn)
+                    }
+                } header: {
+                    Text("Diagnostics")
+                } footer: {
+                    Text("A running spoof re-asserts its position every 8 seconds because iOS expires a simulated fix that nothing renews. Raising this is a measurement, not a setting to leave changed: it asks whether the developer tunnel survives being idle, or whether iOS hangs up on a channel nobody is using. Teleport once, wait out the interval, and watch what the next tick does — if the position simply lapses and then snaps back, the tunnel held; if the session drops with an error, the tunnel died while idle. That answer decides whether Locus can hold a tunnel open across a Stop so a spoof can be started later without rebuilding it. Takes effect on the next teleport. Set this back to 8s for normal use.")
                 }
 
                 Section {
